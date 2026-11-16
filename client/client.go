@@ -144,7 +144,11 @@ func (c *client) EndRun(sessionID string) {
 func (c *client) Stream(ctx context.Context, req soma.Request, onDelta func(soma.Delta)) (soma.Message, error) {
 	msg, err := c.stream(ctx, req, onDelta)
 	if ctx.Err() != nil {
-		return soma.Message{Role: soma.RoleAssistant, Model: req.Model, StopReason: soma.StopAborted}, ctx.Err()
+		if msg.Role == "" {
+			msg = soma.Message{Role: soma.RoleAssistant, Model: req.Model}
+		}
+		msg.StopReason = soma.StopAborted
+		return msg, ctx.Err()
 	}
 	return msg, httpwire.Redact(err, c.token)
 }
@@ -168,14 +172,24 @@ func (c *client) stream(ctx context.Context, req soma.Request, onDelta func(soma
 	if err != nil {
 		return soma.Message{}, c.somaError(soma.ErrOther, 0, err.Error())
 	}
-	ctx, cancel := context.WithCancelCause(ctx)
+	callerCtx := ctx
+	ctx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
 	defer cancel(nil)
+	a := &aborter{c: c, ctx: ctx, cancel: cancel}
+	defer a.finish()
+	defer context.AfterFunc(callerCtx, a.abort)()
+	if callerCtx.Err() != nil {
+		return soma.Message{}, callerCtx.Err()
+	}
 	res, err := c.request(ctx, http.MethodPost, "/v1/stream", body)
 	if err == nil && res.StatusCode == http.StatusConflict {
 		err = c.uploadMissing(ctx, res, names, req.LoadBlob)
 		res.Body.Close()
 		if err != nil {
 			return soma.Message{}, err
+		}
+		if callerCtx.Err() != nil {
+			return soma.Message{}, callerCtx.Err()
 		}
 		res, err = c.request(ctx, http.MethodPost, "/v1/stream", body)
 		if err == nil && res.StatusCode == http.StatusConflict {
@@ -224,6 +238,7 @@ func (c *client) stream(ctx context.Context, req soma.Request, onDelta func(soma
 		switch {
 		case !started && line.Stream != "" && line.Delta == nil && !line.KeepAlive && !line.Done && line.Message == nil && line.Error == nil:
 			started = true
+			a.started(line.Stream)
 		case !started || line.Stream != "":
 			return soma.Message{}, c.networkError(errors.New("missing or unexpected stream id"))
 		case line.Done && line.Message != nil && line.Delta == nil && !line.KeepAlive:
@@ -239,12 +254,77 @@ func (c *client) stream(ctx context.Context, req soma.Request, onDelta func(soma
 			default:
 				return soma.Message{}, c.networkError(fmt.Errorf("unknown delta kind %q", delta.Kind))
 			}
-			if onDelta != nil {
+			if onDelta != nil && callerCtx.Err() == nil {
 				onDelta(delta)
 			}
 		default:
 			return soma.Message{}, c.networkError(errors.New("incomplete or invalid stream line"))
 		}
+	}
+}
+
+var errAbortUnanswered = errors.New("stream did not end within 5 seconds of its abort")
+
+// aborter turns the caller's cancellation into an abort request, sent once
+// the stream id is known, so the final line still brings the partial message.
+// Dropping the connection instead would make the server abandon the run.
+type aborter struct {
+	c      *client
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+
+	mu       sync.Mutex
+	stream   string
+	aborted  bool
+	finished bool
+	deadline *time.Timer
+}
+
+func (a *aborter) started(stream string) {
+	a.mu.Lock()
+	a.stream = stream
+	send := a.aborted
+	a.mu.Unlock()
+	if send {
+		a.send(stream)
+	}
+}
+
+func (a *aborter) abort() {
+	a.mu.Lock()
+	if a.finished || a.aborted {
+		a.mu.Unlock()
+		return
+	}
+	a.aborted = true
+	a.deadline = time.AfterFunc(5*time.Second, func() { a.cancel(errAbortUnanswered) })
+	stream := a.stream
+	a.mu.Unlock()
+	if stream != "" {
+		a.send(stream)
+	}
+}
+
+func (a *aborter) send(stream string) {
+	body, err := json.Marshal(wire.Abort{Stream: stream})
+	if err != nil {
+		a.cancel(err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
+	defer cancel()
+	res, err := a.c.request(ctx, http.MethodPost, "/v1/abort", body)
+	if err == nil {
+		res.Body.Close()
+	}
+}
+
+func (a *aborter) finish() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.finished = true
+	if a.deadline != nil {
+		a.deadline.Stop()
 	}
 }
 

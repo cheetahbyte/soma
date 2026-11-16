@@ -45,6 +45,7 @@ type Server struct {
 	closed    bool
 	providers map[string]soma.Provider
 	sessions  map[string]map[string]bool
+	streams   map[string]context.CancelFunc
 	wg        sync.WaitGroup
 }
 
@@ -70,8 +71,10 @@ func New(o Options) (*Server, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{o: o, cfg: cfg, mux: http.NewServeMux(), ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		blobs: newBlobStore(o.Root, o.BlobCacheBytes), providers: map[string]soma.Provider{}, sessions: map[string]map[string]bool{}}
+		blobs: newBlobStore(o.Root, o.BlobCacheBytes), providers: map[string]soma.Provider{}, sessions: map[string]map[string]bool{},
+		streams: map[string]context.CancelFunc{}}
 	s.mux.HandleFunc("POST /v1/stream", s.stream)
+	s.mux.HandleFunc("POST /v1/abort", s.abort)
 	s.mux.HandleFunc("POST /v1/endrun", s.endRun)
 	s.mux.HandleFunc("GET /v1/info", s.info)
 	s.mux.HandleFunc("PUT /v1/blobs/{sha256}", s.putBlob)
@@ -138,7 +141,7 @@ func (s *Server) upstream(name string) (soma.Provider, config.ProviderConfig, in
 	return p, pc, 0, nil
 }
 
-func decode[T wire.StreamRequest | wire.EndRun](r *http.Request, v *T) error {
+func decode[T wire.StreamRequest | wire.EndRun | wire.Abort](r *http.Request, v *T) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
@@ -199,8 +202,17 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, false, err)
 		return
 	}
+	stream := hex.EncodeToString(id[:])
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	s.mu.Lock()
+	s.streams[stream] = cancel
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.streams, stream)
+		s.mu.Unlock()
+	}()
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	enc := json.NewEncoder(w)
 	write := func(line wire.Line) error {
@@ -209,23 +221,24 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		}
 		return http.NewResponseController(w).Flush()
 	}
-	if err := write(wire.Line{Stream: hex.EncodeToString(id[:])}); err != nil {
+	if err := write(wire.Line{Stream: stream}); err != nil {
 		return
 	}
 	lines := make(chan wire.Line, 64)
 	finished := make(chan struct{})
+	quit := make(chan struct{})
 	go func() {
 		defer close(finished)
 		send := func(line wire.Line) {
 			select {
 			case lines <- line:
-			case <-ctx.Done():
+			case <-quit:
 			}
 		}
 		m, err := p.Stream(ctx, req, func(d soma.Delta) { send(wire.Line{Delta: &wire.Delta{Kind: string(d.Kind), Text: d.Text}}) })
 		send(wire.Line{Done: true, Message: &m, Error: encodeError(err, true)})
 	}()
-	defer func() { cancel(); <-finished }()
+	defer func() { cancel(); close(quit); <-finished }()
 	timer := time.NewTimer(s.o.KeepAlive)
 	defer timer.Stop()
 	for {
@@ -240,10 +253,27 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			timer.Reset(s.o.KeepAlive)
-		case <-ctx.Done():
+		case <-r.Context().Done():
 			return
 		}
 	}
+}
+
+func (s *Server) abort(w http.ResponseWriter, r *http.Request) {
+	var body wire.Abort
+	if err := decode(r, &body); err != nil || body.Stream == "" {
+		writeError(w, http.StatusBadRequest, false, errors.New("soma: abort requires stream in one JSON object"))
+		return
+	}
+	s.mu.Lock()
+	cancel := s.streams[body.Stream]
+	s.mu.Unlock()
+	if cancel == nil {
+		writeError(w, http.StatusNotFound, false, fmt.Errorf("soma: stream %q is not in progress", body.Stream))
+		return
+	}
+	cancel()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {

@@ -822,3 +822,37 @@ func TestBlobCacheBounded(t *testing.T) {
 		t.Fatalf("stored blobs = %v, want only the newer %s", names, hashOf(newer))
 	}
 }
+
+func TestAbortKeepsPartialText(t *testing.T) {
+	model := testmodel.Start([]testmodel.Step{{Text: "par", Hang: true}})
+	defer model.Close()
+	g := startGateway(t, modelConfig(model.URL), server.Options{})
+	p, _, _ := remote(t, g, token)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	m, err := p.Stream(ctx, request(), func(d soma.Delta) {
+		if d.Kind == soma.DeltaText && d.Text == "par" {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("aborted stream error = %v, want the context's error", err)
+	}
+	if m.Text() != "par" || m.StopReason != soma.StopAborted || m.Role != soma.RoleAssistant {
+		t.Fatalf("aborted message = %+v, want the partial text with stop reason aborted", m)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("abort took %v; the server did not end the stream", elapsed)
+	}
+}
+
+func TestAbortUnknownStream(t *testing.T) {
+	g := startGateway(t, modelConfig("http://127.0.0.1:1"), server.Options{})
+	res := rawRequest(t, g, http.MethodPost, "/v1/abort", `{"stream":"no-such-stream"}`, strconv.Itoa(wire.Version), token)
+	var e wire.Error
+	err := json.NewDecoder(res.Body).Decode(&e)
+	if res.StatusCode != http.StatusNotFound || err != nil || !strings.Contains(e.Message, "no-such-stream") {
+		t.Fatalf("abort of an unknown stream: status %d, %+v, %v", res.StatusCode, e, err)
+	}
+}
