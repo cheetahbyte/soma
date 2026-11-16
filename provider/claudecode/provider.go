@@ -40,6 +40,7 @@ func init() {
 		}
 		pr := New(p.Name, command, p.AllowExtraUsage)
 		pr.info = provider.ModelInfoFunc(cfg, p)
+		pr.dir = cfg.ClaudeDir
 		return pr, nil
 	})
 }
@@ -49,6 +50,7 @@ type Provider struct {
 	command    string
 	allowExtra bool
 	info       func(id string) config.ModelInfo // nil: no prices, so no estimate before a turn ends
+	dir        string
 
 	mu      sync.Mutex
 	procs   map[string]*proc
@@ -148,7 +150,7 @@ func (p *Provider) Stream(ctx context.Context, req soma.Request, onDelta func(so
 				pl.History = lateResults(req.Messages)
 			}
 			var err error
-			if pr, err = spawn(p.command, req, pl.Resume, false, p.info); err != nil {
+			if pr, err = spawn(p.command, p.dir, req, pl.Resume, false, p.info); err != nil {
 				return soma.Message{}, &soma.ProviderError{Kind: soma.ErrOther, Message: err.Error()}
 			}
 			if pl.Resume != "" {
@@ -194,7 +196,7 @@ func asProviderError(err error) error {
 }
 
 func (p *Provider) oneShot(ctx context.Context, req soma.Request, onDelta func(soma.Delta)) (soma.Message, error) {
-	pr, err := spawn(p.command, req, "", true, p.info)
+	pr, err := spawn(p.command, p.dir, req, "", true, p.info)
 	if err != nil {
 		return soma.Message{}, &soma.ProviderError{Kind: soma.ErrOther, Message: err.Error()}
 	}

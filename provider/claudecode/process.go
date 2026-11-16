@@ -120,10 +120,15 @@ func toolNames(specs []soma.ToolSpec) []string {
 	return out
 }
 
-// spawn starts claude for req. Without oneShot it also starts the tool
-// server the process is configured with; the secret is passed in the
-// environment only.
-func spawn(command string, req soma.Request, resume string, oneShot bool, price func(id string) config.ModelInfo) (*proc, error) {
+// spawn starts claude for req in dir, or in the current directory when dir
+// is empty. Without oneShot it also starts the tool server the process is
+// configured with; the secret is passed in the environment only.
+func spawn(command, dir string, req soma.Request, resume string, oneShot bool, price func(id string) config.ModelInfo) (*proc, error) {
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
+	}
 	pr := &proc{
 		price:   price,
 		oneShot: oneShot,
@@ -166,6 +171,7 @@ func spawn(command string, req soma.Request, resume string, oneShot bool, price 
 		env = append(env, secretEnv+"="+secret)
 	}
 	cmd := exec.Command(command, args...)
+	cmd.Dir = dir
 	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stderr = tailWriter{pr}

@@ -16,12 +16,14 @@ type live struct {
 }
 
 // run is a session of a conversation-holding upstream that may hold a
-// process: at most one stream in flight, or else the grace timer.
+// process: at most one stream in flight, or else the grace timer. It keeps
+// the provider holding the process across reloads.
 type run struct {
 	busy  chan struct{}
 	cur   *live
 	timer *time.Timer
 	gen   int
+	p     soma.Provider
 }
 
 type abandoner interface{ Abandon(sessionID string) }
@@ -34,16 +36,16 @@ func abandon(p soma.Provider, session string) {
 	}
 }
 
-// begin makes l the session's stream in flight. An earlier stream of the
-// session still in flight is one the asking side gave up on, so it is ended
-// as abandoned before l starts.
-func (s *Server) begin(key runKey, l *live) {
+// begin makes l the session's stream in flight, after ending an earlier one
+// the asking side gave up on as abandoned. It returns the run's provider, p
+// for a new run, and whether the session was abandoned since its last stream.
+func (s *Server) begin(key runKey, l *live, p soma.Provider) (_ soma.Provider, restart bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for {
 		r := s.runs[key]
 		if r == nil {
-			r = &run{}
+			r = &run{p: p}
 			s.runs[key] = r
 		}
 		if r.busy == nil {
@@ -52,7 +54,9 @@ func (s *Server) begin(key runKey, l *live) {
 				r.timer = nil
 			}
 			r.busy, r.cur = make(chan struct{}), l
-			return
+			restart = s.pending[key]
+			delete(s.pending, key)
+			return r.p, restart
 		}
 		busy := r.busy
 		r.cur.superseded = true
@@ -76,6 +80,9 @@ func (s *Server) end(key runKey, l *live, p soma.Provider, delivered bool, err e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.runs[key]
+	if abandoned {
+		s.pending[key] = true
+	}
 	close(r.busy)
 	r.busy, r.cur = nil, nil
 	switch {
@@ -96,13 +103,22 @@ func (s *Server) expire(key runKey, gen int) {
 		return
 	}
 	delete(s.runs, key)
-	p := s.providers[key.upstream]
+	p := r.p
 	s.wg.Add(1)
 	s.mu.Unlock()
 	defer s.wg.Done()
 	if e, ok := p.(soma.RunEnder); ok {
 		e.EndRun(key.session)
 	}
+}
+
+func (s *Server) runProvider(key runKey) soma.Provider {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r := s.runs[key]; r != nil {
+		return r.p
+	}
+	return nil
 }
 
 func (s *Server) forget(key runKey) {
@@ -125,7 +141,7 @@ func (s *Server) endAll() {
 		if r.timer != nil {
 			r.timer.Stop()
 		}
-		if e, ok := s.providers[key.upstream].(soma.RunEnder); ok {
+		if e, ok := r.p.(soma.RunEnder); ok {
 			enders[key] = e
 		}
 	}

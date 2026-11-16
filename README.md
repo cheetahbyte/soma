@@ -2,7 +2,7 @@
 
 Soma extracts axon's model access into `github.com/cheetahbyte/soma`, a Go library with no dependencies outside the standard library.
 
-Implementation is in progress. Local providers, HTTP streaming, blob transfer, and the `soma` command are available. Partial replies on abort, session recovery, and configuration reload aren't implemented yet.
+Implementation is in progress. Local providers, HTTP streaming, blob transfer, partial replies on abort, session recovery, configuration reload, and the `soma` command are available.
 
 ## Library
 

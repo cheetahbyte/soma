@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -19,7 +22,7 @@ import (
 	"github.com/cheetahbyte/soma/config"
 	"github.com/cheetahbyte/soma/provider"
 	_ "github.com/cheetahbyte/soma/provider/chat"
-	_ "github.com/cheetahbyte/soma/provider/claudecode"
+	"github.com/cheetahbyte/soma/provider/claudecode"
 	_ "github.com/cheetahbyte/soma/provider/openai"
 	"github.com/cheetahbyte/soma/wire"
 )
@@ -34,19 +37,50 @@ type Options struct {
 
 type Server struct {
 	o      Options
-	cfg    *config.Config
 	mux    *http.ServeMux
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
 	blobs  *blobStore
 
+	loadMu sync.Mutex
+	cfg    *config.Config
+	stamp  stamp
+
 	mu        sync.Mutex
 	closed    bool
 	providers map[string]soma.Provider
 	runs      map[runKey]*run
+	pending   map[runKey]bool
 	streams   map[string]*live
 	wg        sync.WaitGroup
+}
+
+// stamp identifies the versions of models.json and auth.json a configuration
+// was loaded from; a missing file has the zero value.
+type stamp [2]struct {
+	exists bool
+	mod    int64
+	size   int64
+}
+
+func readStamp(root string) stamp {
+	var st stamp
+	for i, name := range []string{"models.json", "auth.json"} {
+		if fi, err := os.Stat(filepath.Join(root, name)); err == nil {
+			st[i].exists, st[i].mod, st[i].size = true, fi.ModTime().UnixNano(), fi.Size()
+		}
+	}
+	return st
+}
+
+func load(root string) (*config.Config, error) {
+	cfg, err := config.Load(root)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ClaudeDir = filepath.Join(root, "claude-work")
+	return cfg, nil
 }
 
 func New(o Options) (*Server, error) {
@@ -65,14 +99,20 @@ func New(o Options) (*Server, error) {
 	if o.BlobCacheBytes <= 0 {
 		o.BlobCacheBytes = 512 << 20
 	}
-	cfg, err := config.Load(o.Root)
+	st := readStamp(o.Root)
+	cfg, err := load(o.Root)
 	if err != nil {
 		return nil, err
 	}
+	for _, name := range []string{"SOMA_TOKEN", "TS_AUTHKEY"} {
+		if !slices.Contains(claudecode.StripEnv, name) {
+			claudecode.StripEnv = append(claudecode.StripEnv, name)
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{o: o, cfg: cfg, mux: http.NewServeMux(), ctx: ctx, cancel: cancel, done: make(chan struct{}),
+	s := &Server{o: o, cfg: cfg, stamp: st, mux: http.NewServeMux(), ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		blobs: newBlobStore(o.Root, o.BlobCacheBytes), providers: map[string]soma.Provider{}, runs: map[runKey]*run{},
-		streams: map[string]*live{}}
+		pending: map[runKey]bool{}, streams: map[string]*live{}}
 	s.mux.HandleFunc("POST /v1/stream", s.stream)
 	s.mux.HandleFunc("POST /v1/abort", s.abort)
 	s.mux.HandleFunc("POST /v1/endrun", s.endRun)
@@ -115,30 +155,59 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r.WithContext(ctx))
 }
 
-func (s *Server) upstream(name string) (soma.Provider, config.ProviderConfig, int, error) {
+// config returns the configuration, loaded again when models.json or
+// auth.json changed since it was loaded. A reload drops the cached providers;
+// a run keeps the provider it started with until it ends.
+func (s *Server) config() (*config.Config, error) {
+	s.loadMu.Lock()
+	defer s.loadMu.Unlock()
+	st := readStamp(s.o.Root)
+	if st == s.stamp {
+		return s.cfg, nil
+	}
+	cfg, err := load(s.o.Root)
+	if err != nil {
+		return nil, err
+	}
+	s.cfg, s.stamp = cfg, st
+	s.mu.Lock()
+	s.providers = map[string]soma.Provider{}
+	s.mu.Unlock()
+	return cfg, nil
+}
+
+func (s *Server) upstream(name string) (soma.Provider, *config.Config, config.ProviderConfig, int, error) {
+	cfg, err := s.config()
+	if err != nil {
+		return nil, nil, config.ProviderConfig{}, http.StatusInternalServerError, fmt.Errorf("soma: reading the configuration: %w", err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	pc, ok := s.cfg.Providers[name]
+	pc, ok := cfg.Providers[name]
 	if !ok {
-		return nil, pc, http.StatusNotFound, fmt.Errorf("soma: upstream %q is not defined", name)
+		return nil, cfg, pc, http.StatusNotFound, fmt.Errorf("soma: upstream %q is not defined", name)
 	}
 	if pc.API == "soma" {
-		return nil, pc, http.StatusBadRequest, fmt.Errorf("soma: upstream %q may not be another soma entry", name)
+		return nil, cfg, pc, http.StatusBadRequest, fmt.Errorf("soma: upstream %q may not be another soma entry", name)
 	}
 	p := s.providers[name]
 	if p == nil {
 		var err error
-		p, err = provider.New(s.cfg, pc)
+		p, err = provider.New(cfg, pc)
 		if err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, auth.ErrNoLogin) {
 				status = http.StatusUnauthorized
 			}
-			return nil, pc, status, err
+			return nil, cfg, pc, status, err
 		}
 		s.providers[name] = p
 	}
-	return p, pc, 0, nil
+	return p, cfg, pc, 0, nil
+}
+
+func fromUpstream(status int, pc config.ProviderConfig) bool {
+	return status != http.StatusNotFound && status != http.StatusInternalServerError && pc.API != "soma"
 }
 
 func decode[T wire.StreamRequest | wire.EndRun | wire.Abort](r *http.Request, v *T) error {
@@ -164,9 +233,9 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, false, errors.New("soma: upstream and model are required"))
 		return
 	}
-	p, pc, status, err := s.upstream(body.Upstream)
+	p, _, pc, status, err := s.upstream(body.Upstream)
 	if err != nil {
-		writeError(w, status, status != http.StatusNotFound && pc.API != "soma", err)
+		writeError(w, status, fromUpstream(status, pc), err)
 		return
 	}
 	missing, release, err := s.blobs.acquire(body.Blobs)
@@ -223,8 +292,9 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if tracked {
-		s.begin(key, l)
-		if body.AfterFailedStream {
+		var restart bool
+		p, restart = s.begin(key, l, p)
+		if body.AfterFailedStream || restart {
 			abandon(p, key.session)
 		}
 	}
@@ -299,23 +369,23 @@ func (s *Server) abort(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("upstream")
-	p, pc, status, err := s.upstream(name)
+	p, cfg, pc, status, err := s.upstream(name)
 	if err != nil {
-		writeError(w, status, status != http.StatusNotFound && pc.API != "soma", err)
+		writeError(w, status, fromUpstream(status, pc), err)
 		return
 	}
 	models := pc.Models
 	if pc.NeedsCatalog() {
-		cat, ok := config.LoadCatalog(s.cfg.Root, name)
+		cat, ok := config.LoadCatalog(cfg.Root, name)
 		if !ok || cat.Stale(time.Now()) {
 			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-			models, err = provider.FetchModels(ctx, s.cfg, pc)
+			models, err = provider.FetchModels(ctx, cfg, pc)
 			cancel()
 			cat = config.Catalog{Fetched: time.Now(), Models: models}
 			if err != nil {
 				cat.Error = err.Error()
 			}
-			if serr := config.SaveCatalog(s.cfg.Root, name, cat); err == nil {
+			if serr := config.SaveCatalog(cfg.Root, name, cat); err == nil {
 				err = serr
 			}
 		} else {
@@ -334,7 +404,7 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 		info.HoldsConversation = h.HoldsConversation()
 	}
 	for _, m := range models {
-		_, resolved, err := s.cfg.Model(name + "/" + m.ID)
+		_, resolved, err := cfg.Model(name + "/" + m.ID)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, true, err)
 			return
@@ -351,15 +421,21 @@ func (s *Server) endRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, false, errors.New("soma: endrun requires upstream and sessionId in one JSON object"))
 		return
 	}
-	p, pc, status, err := s.upstream(body.Upstream)
-	if err != nil {
-		writeError(w, status, status != http.StatusNotFound && pc.API != "soma", err)
-		return
+	key := runKey{body.Upstream, body.SessionID}
+	p := s.runProvider(key)
+	if p == nil {
+		var pc config.ProviderConfig
+		var status int
+		var err error
+		if p, _, pc, status, err = s.upstream(body.Upstream); err != nil {
+			writeError(w, status, fromUpstream(status, pc), err)
+			return
+		}
 	}
 	if ender, ok := p.(soma.RunEnder); ok {
 		ender.EndRun(body.SessionID)
 	}
-	s.forget(runKey{body.Upstream, body.SessionID})
+	s.forget(key)
 	w.WriteHeader(http.StatusNoContent)
 }
 

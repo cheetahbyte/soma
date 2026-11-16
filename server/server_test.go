@@ -26,10 +26,13 @@ import (
 	"time"
 
 	"github.com/cheetahbyte/soma"
+	"github.com/cheetahbyte/soma/auth"
 	_ "github.com/cheetahbyte/soma/client"
 	"github.com/cheetahbyte/soma/config"
 	"github.com/cheetahbyte/soma/provider"
+	"github.com/cheetahbyte/soma/provider/claudecode"
 	"github.com/cheetahbyte/soma/server"
+	testauth "github.com/cheetahbyte/soma/somatest/auth"
 	testclaude "github.com/cheetahbyte/soma/somatest/claude"
 	testmodel "github.com/cheetahbyte/soma/somatest/model"
 	"github.com/cheetahbyte/soma/wire"
@@ -901,6 +904,8 @@ func (c *fakeClaude) config() config.ProviderConfig {
 type claudeStart struct {
 	Pid  int      `json:"pid"`
 	Args []string `json:"args"`
+	Env  []string `json:"env"`
+	Cwd  string   `json:"cwd"`
 }
 
 func (c *fakeClaude) starts(t *testing.T) []claudeStart {
@@ -1173,5 +1178,255 @@ func TestClientMarksRetryAfterFailedStream(t *testing.T) {
 	}
 	if want := []bool{false, true, false, false}; !reflect.DeepEqual(flags, want) {
 		t.Fatalf("afterFailedStream per request = %v, want %v", flags, want)
+	}
+}
+
+// serveRoot starts a server on root as it is, with or without models.json.
+func serveRoot(t *testing.T, root string, o server.Options) *gateway {
+	t.Helper()
+	o.Root, o.Token = root, token
+	s, err := server.New(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := httptest.NewServer(s.Handler())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := s.Shutdown(ctx); err != nil {
+			t.Error(err)
+		}
+		h.Close()
+	})
+	return &gateway{s: s, srv: h}
+}
+
+func remoteUpstream(t *testing.T, g *gateway, upstream string) soma.Provider {
+	t.Helper()
+	pc := config.ProviderConfig{Name: "home", API: "soma", BaseURL: g.srv.URL, APIKey: token, Upstream: upstream}
+	cfg := &config.Config{Root: t.TempDir(), Providers: map[string]config.ProviderConfig{pc.Name: pc}}
+	p, err := provider.New(cfg, pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func saveLogin(t *testing.T, root string) {
+	t.Helper()
+	expires := time.Now().Add(time.Hour)
+	if err := auth.SaveCodex(root, auth.Codex{Type: "oauth", Access: testauth.JWT("acct_test", expires), Refresh: "rt-1",
+		Expires: expires.UnixMilli(), AccountID: "acct_test"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeModels(t *testing.T, root, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, "models.json"), []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoginAfterStart(t *testing.T) {
+	program := soma.Program
+	soma.Program = "soma"
+	t.Cleanup(func() { soma.Program = program })
+	model := testmodel.Start([]testmodel.Step{{Text: "logged in"}})
+	defer model.Close()
+	root := t.TempDir()
+	writeModels(t, root, `{"providers":{"chatgpt":{"api":"codex","baseUrl":`+strconv.Quote(model.URL)+`}}}`)
+	g := serveRoot(t, root, server.Options{})
+	p := remoteUpstream(t, g, "chatgpt")
+	_, _, err := call(t, p, request())
+	var pe *soma.ProviderError
+	if !errors.As(err, &pe) || pe.Kind != soma.ErrAuth || !strings.Contains(pe.Message, "soma login codex") {
+		t.Fatalf("request without a login = %v", err)
+	}
+	saveLogin(t, root)
+	m, _, err := call(t, p, request())
+	if err != nil || m.Text() != "logged in" {
+		t.Fatalf("request after the login = %+v, %v", m, err)
+	}
+}
+
+func TestNoModelsFileOffersDefaults(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	root := t.TempDir()
+	g := serveRoot(t, root, server.Options{})
+	info := func() (int, wire.Info) {
+		res := rawRequest(t, g, http.MethodGet, "/v1/info?upstream=chatgpt", "", strconv.Itoa(wire.Version), token)
+		var out wire.Info
+		if res.StatusCode == http.StatusOK {
+			if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return res.StatusCode, out
+	}
+	if status, _ := info(); status != http.StatusNotFound {
+		t.Fatalf("chatgpt without a login: status %d, want 404", status)
+	}
+	saveLogin(t, root)
+	status, got := info()
+	if status != http.StatusOK || len(got.Models) == 0 || got.HoldsConversation {
+		t.Fatalf("chatgpt after a login: status %d, %+v", status, got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "models.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the server wrote models.json: %v", err)
+	}
+}
+
+func TestSomaUpstreamRefused(t *testing.T) {
+	var mu sync.Mutex
+	reached := 0
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		reached++
+		mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer target.Close()
+	g := startGateway(t, config.ProviderConfig{API: "soma", BaseURL: target.URL, APIKey: token, Upstream: "other"}, server.Options{})
+	p, _, _ := remote(t, g, token)
+	_, _, err := call(t, p, request())
+	var pe *soma.ProviderError
+	if !errors.As(err, &pe) || pe.Status != http.StatusBadRequest || !strings.Contains(pe.Message, "soma") {
+		t.Fatalf("stream to a soma upstream = %v", err)
+	}
+	res := rawRequest(t, g, http.MethodGet, "/v1/info?upstream=test", "", strconv.Itoa(wire.Version), token)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("info of a soma upstream: status %d", res.StatusCode)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if reached != 0 {
+		t.Fatalf("the server forwarded %d requests to another soma server", reached)
+	}
+}
+
+func realPath(t *testing.T, path string) string {
+	t.Helper()
+	p, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestClaudeRunsInWorkDir(t *testing.T) {
+	c := newClaude(t, `{}`)
+	g := startGateway(t, c.config(), server.Options{})
+	p, _, _ := remote(t, g, token)
+	if _, _, err := call(t, p, request()); err != nil {
+		t.Fatal(err)
+	}
+	starts := c.starts(t)
+	want := filepath.Join(realPath(t, g.cfg.Root), "claude-work")
+	if len(starts) != 1 {
+		t.Fatalf("starts = %+v", starts)
+	}
+	if starts[0].Cwd == "" || realPath(t, starts[0].Cwd) != want {
+		t.Fatalf("claude ran in %s, want %s", starts[0].Cwd, want)
+	}
+}
+
+func TestSecretsNotInChild(t *testing.T) {
+	t.Setenv("SOMA_TOKEN", "server-token")
+	t.Setenv("TS_AUTHKEY", "tailnet-key")
+	c := newClaude(t, `{}`)
+	startGateway(t, c.config(), server.Options{})
+	g := startGateway(t, c.config(), server.Options{})
+	p, _, _ := remote(t, g, token)
+	if _, _, err := call(t, p, request()); err != nil {
+		t.Fatal(err)
+	}
+	starts := c.starts(t)
+	if len(starts) != 1 || len(starts[0].Env) == 0 {
+		t.Fatalf("starts = %+v", starts)
+	}
+	for _, name := range []string{"SOMA_TOKEN", "TS_AUTHKEY"} {
+		if slices.Contains(starts[0].Env, name) {
+			t.Errorf("the claude child received %s", name)
+		}
+		if n := len(slices.DeleteFunc(slices.Clone(claudecode.StripEnv), func(s string) bool { return s != name })); n > 1 {
+			t.Errorf("claudecode.StripEnv holds %s %d times after two servers", name, n)
+		}
+	}
+}
+
+// touch marks models.json as changed without depending on the clock's
+// resolution.
+func touch(t *testing.T, root string) {
+	t.Helper()
+	path := filepath.Join(root, "models.json")
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := fi.ModTime().Add(time.Hour)
+	if err := os.Chtimes(path, later, later); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReloadKeepsHeldProcess(t *testing.T) {
+	c := newClaude(t, `{}`)
+	g := startGateway(t, c.config(), server.Options{})
+	p, _, _ := remote(t, g, token)
+	req := request()
+	first, _, err := call(t, p, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	touch(t, g.cfg.Root)
+	req.Messages = append(req.Messages, stamped(first), userMessage("again"))
+	if _, _, err := call(t, p, req); err != nil {
+		t.Fatal(err)
+	}
+	other := request()
+	other.SessionID = "other"
+	if _, _, err := call(t, p, other); err != nil {
+		t.Fatal(err)
+	}
+	starts := c.starts(t)
+	if len(starts) != 2 || resumes(starts[1]) {
+		t.Fatalf("a reload must keep the held process of a run; starts = %+v", starts)
+	}
+	touch(t, g.cfg.Root)
+	res := rawRequest(t, g, http.MethodPost, "/v1/endrun", `{"upstream":"test","sessionId":"session"}`, strconv.Itoa(wire.Version), token)
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("endrun status %d", res.StatusCode)
+	}
+	waitGone(t, starts[0].Pid, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := g.s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if running(starts[1].Pid) {
+		t.Fatal("Shutdown left the process of a run started before a reload")
+	}
+}
+
+func TestReloadKeepsAbandonMark(t *testing.T) {
+	c := newClaude(t, `{"turns":[[{"text":["first"]}],[{"text":["par"],"hang":true}]]}`)
+	g := startGateway(t, c.config(), server.Options{})
+	p, _, _ := remote(t, g, token)
+	req := request()
+	first, _, err := call(t, p, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Messages = append(req.Messages, stamped(first), userMessage("continue"))
+	dropStream(t, g, req, "par")
+	touch(t, g.cfg.Root)
+	retry, _, err := call(t, p, req)
+	if err != nil || retry.Text() != "ok" {
+		t.Fatalf("retry = %+v, %v", retry, err)
+	}
+	starts := c.starts(t)
+	if len(starts) != 2 || resumes(starts[1]) {
+		t.Fatalf("a reload must not let the retry of an abandoned run resume it; starts = %+v", starts)
 	}
 }
