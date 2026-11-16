@@ -46,7 +46,7 @@ type ProviderConfig struct {
 
 // NeedsCatalog reports whether the provider's models come from its live model list.
 func (p ProviderConfig) NeedsCatalog() bool {
-	return (p.API == "openai-chat" || p.API == "soma") && len(p.Models) == 0
+	return (p.API == "openai-chat" || p.API == "soma" || p.API == "codex") && len(p.Models) == 0
 }
 
 type Config struct {

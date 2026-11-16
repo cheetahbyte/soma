@@ -31,6 +31,7 @@ import (
 	"github.com/cheetahbyte/soma/config"
 	"github.com/cheetahbyte/soma/provider"
 	"github.com/cheetahbyte/soma/provider/claudecode"
+	"github.com/cheetahbyte/soma/provider/openai"
 	"github.com/cheetahbyte/soma/server"
 	testauth "github.com/cheetahbyte/soma/somatest/auth"
 	testclaude "github.com/cheetahbyte/soma/somatest/claude"
@@ -1252,6 +1253,11 @@ func TestLoginAfterStart(t *testing.T) {
 
 func TestNoModelsFileOffersDefaults(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
+	model := testmodel.Start(nil)
+	defer model.Close()
+	base := openai.DefaultCodexBaseURL
+	openai.DefaultCodexBaseURL = model.URL
+	t.Cleanup(func() { openai.DefaultCodexBaseURL = base })
 	root := t.TempDir()
 	g := serveRoot(t, root, server.Options{})
 	info := func() (int, wire.Info) {
@@ -1274,6 +1280,74 @@ func TestNoModelsFileOffersDefaults(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "models.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the server wrote models.json: %v", err)
+	}
+}
+
+const codexModelList = `{"models":[` +
+	`{"slug":"later","context_window":272000,"max_context_window":872000,"visibility":"list","priority":3,` +
+	`"supported_reasoning_levels":[{"effort":"medium"},{"effort":"high"},{"effort":"max"}]},` +
+	`{"slug":"hidden","context_window":272000,"visibility":"hide","priority":0,"supported_reasoning_levels":[{"effort":"low"}]},` +
+	`{"slug":"first","context_window":500000,"max_context_window":872000,"visibility":"list","priority":1,"model_messages":{"intro":"long"},` +
+	`"supported_reasoning_levels":[{"effort":"low","description":"Fast"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"},{"effort":"max"},{"effort":"ultra"}]},` +
+	`{"slug":"plain","context_window":128000,"visibility":"list","priority":2,"supported_reasoning_levels":[]}]}`
+
+func TestInfoListsCodexModels(t *testing.T) {
+	model := testmodel.Start(nil)
+	defer model.Close()
+	model.SetModels(codexModelList)
+	root := t.TempDir()
+	writeModels(t, root, `{"providers":{"chatgpt":{"api":"codex","baseUrl":`+strconv.Quote(model.URL)+`,"headers":{"X-Extra":"1"}},`+
+		`"fixed":{"api":"codex","baseUrl":`+strconv.Quote(model.URL)+`,"models":[{"id":"mine"}]}}}`)
+	saveLogin(t, root)
+	login, _, err := auth.LoadCodex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := serveRoot(t, root, server.Options{})
+	info := func(upstream string) wire.Info {
+		t.Helper()
+		res := rawRequest(t, g, http.MethodGet, "/v1/info?upstream="+upstream, "", strconv.Itoa(wire.Version), token)
+		var out wire.Info
+		if res.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(res.Body)
+			t.Fatalf("info of %s: status %d, %s", upstream, res.StatusCode, body)
+		}
+		if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	off := false
+	want := []config.ModelInfo{
+		{ID: "first", ContextWindow: 500000, Thinking: []string{"minimal", "low", "medium", "high", "xhigh"}, Effort: map[string]string{"minimal": "low"}},
+		{ID: "plain", ContextWindow: 128000, Reasoning: &off},
+		{ID: "later", ContextWindow: 272000, Thinking: []string{"medium", "high"}},
+	}
+	if got := info("chatgpt"); !reflect.DeepEqual(got.Models, want) || got.HoldsConversation {
+		t.Fatalf("info = %+v, want models %+v", got, want)
+	}
+	reqs := model.ModelRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("%d model list requests, want 1", len(reqs))
+	}
+	r := reqs[0]
+	if r.URL.Path != "/codex/models" || r.URL.Query().Get("client_version") != openai.CodexClientVersion || openai.CodexClientVersion != "0.169.0" {
+		t.Errorf("model list request %s, want /codex/models?client_version=0.169.0", r.URL)
+	}
+	for k, v := range map[string]string{"Authorization": "Bearer " + login.Access, "Chatgpt-Account-Id": "acct_test", "X-Extra": "1"} {
+		if got := r.Header.Get(k); got != v {
+			t.Errorf("header %s = %q, want %q", k, got, v)
+		}
+	}
+	if ua := r.Header.Get("User-Agent"); !strings.HasPrefix(ua, soma.Program+"/") {
+		t.Errorf("User-Agent = %q", ua)
+	}
+	if got := info("fixed"); len(got.Models) != 1 || got.Models[0].ID != "mine" {
+		t.Errorf("explicit models: info = %+v", got)
+	}
+	info("chatgpt")
+	if n := len(model.ModelRequests()); n != 1 || len(model.Requests()) != 0 {
+		t.Errorf("%d model list requests and %d model requests after a cached list and explicit models, want 1 and 0", n, len(model.Requests()))
 	}
 }
 

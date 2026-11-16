@@ -6,20 +6,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/cheetahbyte/soma/auth"
 	"github.com/cheetahbyte/soma/config"
+	"github.com/cheetahbyte/soma/provider"
 	"github.com/cheetahbyte/soma/provider/chat"
 )
 
 const (
 	loginUsage   = "usage: soma login codex | melious --stdin"
 	meliousCheck = 20 * time.Second
+	codexList    = 20 * time.Second
 	maxKeyBytes  = 4096
 )
 
@@ -59,8 +63,34 @@ func codexLogin() int {
 		fmt.Fprintln(os.Stderr, "soma:", err)
 		return 1
 	}
+	cacheCodexModels(ctx, dir)
 	fmt.Println("Logged in to ChatGPT.")
 	return 0
+}
+
+// cacheCodexModels caches the model list of each ChatGPT provider that takes
+// it from ChatGPT. A failure is only reported: the login stands.
+func cacheCodexModels(ctx context.Context, dir string) {
+	cfg, err := config.Load(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "soma: warning: could not read the ChatGPT model list:", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, codexList)
+	defer cancel()
+	for _, name := range slices.Sorted(maps.Keys(cfg.Providers)) {
+		p := cfg.Providers[name]
+		if p.API != "codex" || !p.NeedsCatalog() {
+			continue
+		}
+		models, err := provider.FetchModels(ctx, cfg, p)
+		if err == nil {
+			err = config.SaveCatalog(dir, name, config.Catalog{Fetched: time.Now(), Models: models})
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "soma: warning: could not cache the model list of provider %q: %v\n", name, err)
+		}
+	}
 }
 
 func meliousLogin() int {

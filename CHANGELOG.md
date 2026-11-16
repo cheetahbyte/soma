@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A `codex` provider without `models` takes its models from ChatGPT's model list instead of a bundled table. Hidden models are left out, the models keep ChatGPT's priority order, and `SuggestedDefault` names the first cached one. Each model gets ChatGPT's context window and `minimal` plus the supported levels from `low` to `xhigh`; `off` is offered only through `modelOverrides`. Until a fetch succeeds, any model id is accepted with the default values. `soma login codex` caches the list after the sign-in and warns when it can't read it. Explicit `models` stay authoritative and read no list.
 - Add versioned HTTP streaming libraries with bearer-token authentication and strict request decoding.
 - Add remote model information, conversation-capability caching, and bounded end-of-run signals.
 - Preserve provider errors and detect quiet or incomplete remote streams. Blob transfer and abort recovery remain pending.

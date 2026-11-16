@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -18,7 +19,13 @@ import (
 	"github.com/cheetahbyte/soma/provider"
 )
 
-const DefaultCodexBaseURL = "https://chatgpt.com/backend-api"
+// DefaultCodexBaseURL is a variable so that test builds can point it at a
+// local server.
+var DefaultCodexBaseURL = "https://chatgpt.com/backend-api"
+
+// CodexClientVersion is the Codex client version that the model list
+// request names, as the Codex client does.
+const CodexClientVersion = "0.169.0"
 
 // Pi's isTerminalRateLimitError, plus the ChatGPT backend's own codes.
 var codexLimitPattern = sync.OnceValue(func() *regexp.Regexp {
@@ -33,6 +40,14 @@ func init() {
 			return nil, auth.ErrNoLogin
 		}
 		return NewCodex(p.Name, p.BaseURL, auth.NewCodexSource(cfg.Root, auth.Issuer), p.Headers, provider.ModelInfoFunc(cfg, p)), nil
+	})
+	provider.RegisterLister("codex", func(ctx context.Context, cfg *config.Config, p config.ProviderConfig) ([]config.ModelInfo, error) {
+		if _, ok, err := auth.LoadCodex(cfg.Root); err != nil {
+			return nil, fmt.Errorf("provider %q: %w", p.Name, err)
+		} else if !ok {
+			return nil, auth.ErrNoLogin
+		}
+		return NewCodex(p.Name, p.BaseURL, auth.NewCodexSource(cfg.Root, auth.Issuer), p.Headers, nil).codexModels(ctx)
 	})
 }
 
@@ -107,6 +122,19 @@ func codexURL(base string) string {
 		return base + "/responses"
 	}
 	return base + "/codex/responses"
+}
+
+// codexModelsURL resolves the model list endpoint beside codexURL's, as the
+// Codex client's models manager requests it.
+func codexModelsURL(base string) string {
+	base = strings.TrimRight(base, "/")
+	switch {
+	case strings.HasSuffix(base, "/codex/responses"):
+		base = strings.TrimSuffix(base, "/responses")
+	case !strings.HasSuffix(base, "/codex"):
+		base += "/codex"
+	}
+	return base + "/models?client_version=" + url.QueryEscape(CodexClientVersion)
 }
 
 // codexUsageLimit maps a 429 that reports an exhausted ChatGPT plan to a

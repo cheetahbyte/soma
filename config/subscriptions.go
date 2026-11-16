@@ -33,17 +33,6 @@ func subscriptionModels(api string) []ModelInfo {
 			{ID: "claude-fable-5-2", ContextWindow: 1000000},
 			{ID: "claude-haiku-5-5", ContextWindow: 1000000},
 		}
-	case "codex":
-		return []ModelInfo{
-			{ID: "gpt-6.1-sol", ContextWindow: 500000,
-				Thinking: []string{"minimal", "low", "medium", "high", "xhigh"},
-				Effort:   map[string]string{"minimal": "low"}},
-			{ID: "gpt-6.1-terra", ContextWindow: 500000,
-				Effort: map[string]string{"off": "none", "minimal": "low"}},
-			{ID: "gpt-6-astra", ContextWindow: 272000,
-				Thinking: []string{"minimal", "low", "medium", "high", "xhigh"},
-				Effort:   map[string]string{"minimal": "low"}},
-		}
 	}
 	return nil
 }
@@ -65,9 +54,7 @@ func (c *Config) subscriptionDefaults() string {
 	if !apis["codex"] {
 		if _, exists := c.Providers["chatgpt"]; !exists {
 			if _, loggedIn, err := auth.LoadCodex(c.Root); err == nil && loggedIn {
-				c.Providers["chatgpt"] = ProviderConfig{
-					Name: "chatgpt", API: "codex", Models: subscriptionModels("codex"),
-				}
+				c.Providers["chatgpt"] = ProviderConfig{Name: "chatgpt", API: "codex"}
 				names = append(names, "chatgpt")
 			}
 		}
@@ -83,14 +70,27 @@ func (c *Config) subscriptionDefaults() string {
 		}
 	}
 	melious := c.addMelious()
-	if len(names) > 0 {
-		p := c.Providers[names[0]]
-		return p.Name + "/" + p.Models[0].ID
+	for _, name := range names {
+		if id := c.firstModel(c.Providers[name]); id != "" {
+			return name + "/" + id
+		}
 	}
 	if melious {
 		if id := c.meliousDefault(); id != "" {
 			return MeliousProvider + "/" + id
 		}
+	}
+	return ""
+}
+
+// firstModel is p's first listed model or, for a live list, the first model
+// of its cached list, which for ChatGPT is the server's highest priority.
+func (c *Config) firstModel(p ProviderConfig) string {
+	if len(p.Models) > 0 {
+		return p.Models[0].ID
+	}
+	if cat, ok := LoadCatalog(c.Root, p.Name); ok && p.NeedsCatalog() && len(cat.Models) > 0 {
+		return cat.Models[0].ID
 	}
 	return ""
 }

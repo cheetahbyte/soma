@@ -3,6 +3,7 @@
 package model
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -59,7 +60,20 @@ type Server struct {
 	paths    []string
 	headers  []http.Header
 	expand   func(args string) string
+
+	models       string
+	modelsStatus int
+	modelReqs    []*http.Request
 }
+
+// DefaultModels is the body of GET /codex/models until SetModels or
+// SetModelsStatus replaces it: the ChatGPT model list's shape, with the
+// fields soma reads.
+const DefaultModels = `{"models":[` +
+	`{"slug":"gpt-6.1-sol","context_window":500000,"max_context_window":872000,"visibility":"list","priority":1,"default_reasoning_level":"low",` +
+	`"supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"},{"effort":"max"},{"effort":"ultra"}]},` +
+	`{"slug":"gpt-6-luna","context_window":272000,"max_context_window":872000,"visibility":"list","priority":2,"default_reasoning_level":"medium",` +
+	`"supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"},{"effort":"max"}]}]}`
 
 // script is the steps of the main script or of one lane and what it served.
 type script struct {
@@ -71,7 +85,8 @@ type script struct {
 func Start(steps []Step) *Server { return StartLanes(steps) }
 
 func StartLanes(main []Step, lanes ...Lane) *Server {
-	s := &Server{main: script{steps: main}, lanes: lanes, laneRuns: make([]script, len(lanes))}
+	s := &Server{main: script{steps: main}, lanes: lanes, laneRuns: make([]script, len(lanes)),
+		models: DefaultModels, modelsStatus: http.StatusOK}
 	for i, l := range lanes {
 		s.laneRuns[i].steps = l.Steps
 	}
@@ -127,12 +142,39 @@ func (s *Server) Headers() []http.Header {
 	return append([]http.Header(nil), s.headers...)
 }
 
+// SetModels sets the body of GET /codex/models, answered with status 200.
+func (s *Server) SetModels(body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.models, s.modelsStatus = body, http.StatusOK
+}
+
+// SetModelsStatus makes GET /codex/models answer with status and a generic
+// error body.
+func (s *Server) SetModelsStatus(status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.models, s.modelsStatus = fmt.Sprintf(`{"error":{"message":"scripted status %d"}}`, status), status
+}
+
+// ModelRequests returns the GET /codex/models requests, without bodies, in
+// order. They are not among Requests, Paths, or Headers and use no step.
+func (s *Server) ModelRequests() []*http.Request {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*http.Request(nil), s.modelReqs...)
+}
+
 func (s *Server) Close() {
 	s.srv.CloseClientConnections()
 	s.srv.Close()
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/codex/models") {
+		s.serveModels(w, r)
+		return
+	}
 	body, _ := io.ReadAll(r.Body)
 	lane := s.route(body)
 	s.mu.Lock()
@@ -191,6 +233,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		step.InputTokens = (len(body) + 3) / 4
 	}
 	(&stream{w: w, r: r, step: step, n: n}).run()
+}
+
+func (s *Server) serveModels(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.modelReqs = append(s.modelReqs, r.Clone(context.Background()))
+	body, status := s.models, s.modelsStatus
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	io.WriteString(w, body)
 }
 
 // route returns the index of the first lane that matches body, or -1.
