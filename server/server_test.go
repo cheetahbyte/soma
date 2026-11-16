@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -16,6 +19,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -628,4 +632,193 @@ func TestEndRunDoesNotFetchUnknownCapability(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.(soma.RunEnder).EndRun("run-id")
+}
+
+type exchange struct {
+	method, path string
+	status       int
+	body         []byte
+}
+
+func recordingProxy(t *testing.T, target string) (string, func() []exchange) {
+	t.Helper()
+	u, err := url.Parse(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var seen []exchange
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	proxy.FlushInterval = -1
+	proxy.ModifyResponse = func(res *http.Response) error {
+		e := exchange{method: res.Request.Method, path: res.Request.URL.Path, status: res.StatusCode}
+		if res.StatusCode != http.StatusOK {
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				return err
+			}
+			res.Body.Close()
+			res.Body = io.NopCloser(bytes.NewReader(body))
+			e.body = body
+		}
+		mu.Lock()
+		seen = append(seen, e)
+		mu.Unlock()
+		return nil
+	}
+	srv := httptest.NewServer(proxy)
+	t.Cleanup(srv.Close)
+	return srv.URL, func() []exchange {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]exchange(nil), seen...)
+	}
+}
+
+func remoteAt(t *testing.T, baseURL string) soma.Provider {
+	t.Helper()
+	pc := config.ProviderConfig{Name: "home", API: "soma", BaseURL: baseURL, APIKey: token, Upstream: "test"}
+	cfg := &config.Config{Root: t.TempDir(), Providers: map[string]config.ProviderConfig{pc.Name: pc}}
+	p, err := provider.New(cfg, pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func imageRequest(name string, data []byte) soma.Request {
+	req := request()
+	req.Messages = []soma.Message{{Role: soma.RoleUser, Blocks: []soma.Block{
+		{Type: soma.BlockText, Text: "look"}, {Type: soma.BlockImage, Blob: name, MIME: "image/png"},
+	}}}
+	req.LoadBlob = func(n string) ([]byte, error) {
+		if n != name {
+			return nil, os.ErrNotExist
+		}
+		return data, nil
+	}
+	return req
+}
+
+func hashOf(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func storedBlobs(t *testing.T, root string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(root, "blobs"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+func TestBlobUploadedOnce(t *testing.T) {
+	model := testmodel.Start([]testmodel.Step{{Text: "one"}, {Text: "two"}})
+	defer model.Close()
+	g := startGateway(t, modelConfig(model.URL), server.Options{})
+	proxyURL, seen := recordingProxy(t, g.srv.URL)
+	p := remoteAt(t, proxyURL)
+	image := []byte("png bytes of a screenshot")
+	for _, name := range []string{"shot", "same-image-again"} {
+		if m, _, err := call(t, p, imageRequest(name, image)); err != nil {
+			t.Fatalf("request naming %s: %+v, %v", name, m, err)
+		}
+	}
+	puts := 0
+	for _, e := range seen() {
+		if e.method == http.MethodPut {
+			puts++
+			if e.path != "/v1/blobs/"+hashOf(image) || e.status != http.StatusNoContent {
+				t.Fatalf("upload = %+v", e)
+			}
+		}
+	}
+	if puts != 1 {
+		t.Fatalf("image uploaded %d times, want once: %+v", puts, seen())
+	}
+	if len(model.Requests()) != 2 {
+		t.Fatalf("upstream received %d requests, want 2", len(model.Requests()))
+	}
+}
+
+func TestMissingBlobAnswered(t *testing.T) {
+	model := testmodel.Start([]testmodel.Step{{Text: "seen"}})
+	defer model.Close()
+	g := startGateway(t, modelConfig(model.URL), server.Options{})
+	image := []byte("\x89PNG image payload")
+	hash := hashOf(image)
+	body, err := json.Marshal(wire.StreamRequest{Upstream: "test", Request: wire.Request{Model: "m"}, Blobs: map[string]string{"shot": hash}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := rawRequest(t, g, http.MethodPost, "/v1/stream", string(body), strconv.Itoa(wire.Version), token)
+	var missing wire.MissingBlobs
+	if err := json.NewDecoder(res.Body).Decode(&missing); res.StatusCode != http.StatusConflict || err != nil || !reflect.DeepEqual(missing.Missing, []string{hash}) {
+		t.Fatalf("missing blob answer: status %d, %+v, %v", res.StatusCode, missing, err)
+	}
+	if len(model.Requests()) != 0 {
+		t.Fatal("a request with a missing blob reached the provider")
+	}
+	proxyURL, seen := recordingProxy(t, g.srv.URL)
+	m, _, err := call(t, remoteAt(t, proxyURL), imageRequest("shot", image))
+	if err != nil || m.Text() != "seen" {
+		t.Fatalf("retried request: %+v, %v", m, err)
+	}
+	var trace []string
+	for _, e := range seen() {
+		trace = append(trace, e.method+" "+e.path+" "+strconv.Itoa(e.status))
+	}
+	want := []string{"POST /v1/stream 409", "PUT /v1/blobs/" + hash + " 204", "POST /v1/stream 200"}
+	if !reflect.DeepEqual(trace, want) {
+		t.Fatalf("exchanges = %v, want %v", trace, want)
+	}
+	if first := seen()[0]; !bytes.Contains(first.body, []byte(hash)) {
+		t.Fatalf("409 body does not name the hash: %s", first.body)
+	}
+	bodies := model.Requests()
+	if len(bodies) != 1 || !bytes.Contains(bodies[0], []byte(base64.StdEncoding.EncodeToString(image))) {
+		t.Fatalf("provider did not receive the image bytes: %s", bodies)
+	}
+}
+
+func TestBlobHashChecked(t *testing.T) {
+	g := startGateway(t, modelConfig("http://127.0.0.1:1"), server.Options{})
+	version := strconv.Itoa(wire.Version)
+	for _, path := range []string{"/v1/blobs/" + hashOf([]byte("expected")), "/v1/blobs/not-a-hash", "/v1/blobs/" + strings.ToUpper(hashOf([]byte("other")))} {
+		res := rawRequest(t, g, http.MethodPut, path, "different", version, token)
+		if res.StatusCode != http.StatusBadRequest {
+			t.Fatalf("PUT %s: status %d", path, res.StatusCode)
+		}
+	}
+	if names := storedBlobs(t, g.cfg.Root); len(names) != 0 {
+		t.Fatalf("rejected uploads left blobs: %v", names)
+	}
+	res := rawRequest(t, g, http.MethodPut, "/v1/blobs/"+hashOf([]byte("matching")), "matching", version, token)
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("matching upload: status %d", res.StatusCode)
+	}
+	if names := storedBlobs(t, g.cfg.Root); !reflect.DeepEqual(names, []string{hashOf([]byte("matching"))}) {
+		t.Fatalf("stored blobs = %v", names)
+	}
+}
+
+func TestBlobCacheBounded(t *testing.T) {
+	g := startGateway(t, modelConfig("http://127.0.0.1:1"), server.Options{BlobCacheBytes: 10})
+	version := strconv.Itoa(wire.Version)
+	older, newer := []byte("8 bytes!"), []byte("8 more!!")
+	for _, data := range [][]byte{older, newer} {
+		res := rawRequest(t, g, http.MethodPut, "/v1/blobs/"+hashOf(data), string(data), version, token)
+		if res.StatusCode != http.StatusNoContent {
+			t.Fatalf("upload: status %d", res.StatusCode)
+		}
+	}
+	if names := storedBlobs(t, g.cfg.Root); !reflect.DeepEqual(names, []string{hashOf(newer)}) {
+		t.Fatalf("stored blobs = %v, want only the newer %s", names, hashOf(newer))
+	}
 }

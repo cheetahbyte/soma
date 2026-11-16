@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -158,7 +160,8 @@ func (c *client) stream(ctx context.Context, req soma.Request, onDelta func(soma
 	for i, tool := range req.Tools {
 		tools[i] = wire.Tool{Name: tool.Name, Description: tool.Description, Schema: tool.Schema}
 	}
-	body, err := json.Marshal(wire.StreamRequest{Upstream: c.upstream, Request: wire.Request{
+	blobs, names := hashBlobs(req)
+	body, err := json.Marshal(wire.StreamRequest{Upstream: c.upstream, Blobs: blobs, Request: wire.Request{
 		Model: req.Model, System: req.System, Messages: messages, Tools: tools,
 		Thinking: req.Thinking, SessionID: req.SessionID, Epoch: req.Epoch,
 	}})
@@ -168,6 +171,18 @@ func (c *client) stream(ctx context.Context, req soma.Request, onDelta func(soma
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	res, err := c.request(ctx, http.MethodPost, "/v1/stream", body)
+	if err == nil && res.StatusCode == http.StatusConflict {
+		err = c.uploadMissing(ctx, res, names, req.LoadBlob)
+		res.Body.Close()
+		if err != nil {
+			return soma.Message{}, err
+		}
+		res, err = c.request(ctx, http.MethodPost, "/v1/stream", body)
+		if err == nil && res.StatusCode == http.StatusConflict {
+			res.Body.Close()
+			return soma.Message{}, c.somaError(soma.ErrOther, res.StatusCode, "server still lacks blobs after they were uploaded")
+		}
+	}
 	if err != nil {
 		return soma.Message{}, c.networkError(err)
 	}
@@ -231,6 +246,75 @@ func (c *client) stream(ctx context.Context, req soma.Request, onDelta func(soma
 			return soma.Message{}, c.networkError(errors.New("incomplete or invalid stream line"))
 		}
 	}
+}
+
+// hashBlobs maps every blob the messages reference to its SHA-256; a blob
+// that cannot be loaded is left out, so the server's provider reports it
+// as a local provider would.
+func hashBlobs(req soma.Request) (map[string]string, map[string]string) {
+	if req.LoadBlob == nil {
+		return nil, nil
+	}
+	blobs, names := map[string]string{}, map[string]string{}
+	for _, m := range req.Messages {
+		for _, b := range m.Blocks {
+			if b.Blob == "" {
+				continue
+			}
+			if _, ok := blobs[b.Blob]; ok {
+				continue
+			}
+			data, err := req.LoadBlob(b.Blob)
+			if err != nil {
+				continue
+			}
+			sum := sha256.Sum256(data)
+			h := hex.EncodeToString(sum[:])
+			blobs[b.Blob], names[h] = h, b.Blob
+		}
+	}
+	if len(blobs) == 0 {
+		return nil, nil
+	}
+	return blobs, names
+}
+
+func (c *client) uploadMissing(ctx context.Context, res *http.Response, names map[string]string, load func(string) ([]byte, error)) error {
+	if err := c.checkProtocol(res); err != nil {
+		return err
+	}
+	dec := json.NewDecoder(io.LimitReader(res.Body, 1024*1024))
+	dec.DisallowUnknownFields()
+	var missing wire.MissingBlobs
+	if err := dec.Decode(&missing); err != nil {
+		return c.networkError(fmt.Errorf("invalid missing-blob answer: %w", err))
+	}
+	if err := endJSON(dec); err != nil {
+		return c.networkError(err)
+	}
+	for _, h := range missing.Missing {
+		name, ok := names[h]
+		if !ok {
+			return c.somaError(soma.ErrOther, res.StatusCode, fmt.Sprintf("server asked for blob %s, which the request does not name", h))
+		}
+		data, err := load(name)
+		if err != nil {
+			return c.somaError(soma.ErrOther, 0, fmt.Sprintf("load blob %s: %v", name, err))
+		}
+		put, err := c.request(ctx, http.MethodPut, "/v1/blobs/"+h, data)
+		if err != nil {
+			return c.networkError(err)
+		}
+		err = c.checkProtocol(put)
+		if err == nil && put.StatusCode != http.StatusNoContent {
+			err = c.responseError(put)
+		}
+		put.Body.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *client) request(ctx context.Context, method, path string, body []byte) (*http.Response, error) {

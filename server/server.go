@@ -39,6 +39,7 @@ type Server struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+	blobs  *blobStore
 
 	mu        sync.Mutex
 	closed    bool
@@ -69,10 +70,11 @@ func New(o Options) (*Server, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{o: o, cfg: cfg, mux: http.NewServeMux(), ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		providers: map[string]soma.Provider{}, sessions: map[string]map[string]bool{}}
+		blobs: newBlobStore(o.Root, o.BlobCacheBytes), providers: map[string]soma.Provider{}, sessions: map[string]map[string]bool{}}
 	s.mux.HandleFunc("POST /v1/stream", s.stream)
 	s.mux.HandleFunc("POST /v1/endrun", s.endRun)
 	s.mux.HandleFunc("GET /v1/info", s.info)
+	s.mux.HandleFunc("PUT /v1/blobs/{sha256}", s.putBlob)
 	return s, nil
 }
 
@@ -164,6 +166,16 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, status != http.StatusNotFound && pc.API != "soma", err)
 		return
 	}
+	missing, release, err := s.blobs.acquire(body.Blobs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, false, err)
+		return
+	}
+	if len(missing) > 0 {
+		writeMissing(w, missing)
+		return
+	}
+	defer release()
 	if h, ok := p.(soma.ConversationHolder); ok && h.HoldsConversation() && len(body.Request.Tools) > 0 {
 		if body.Request.SessionID == "" {
 			writeError(w, http.StatusBadRequest, false, errors.New("soma: sessionId is required for a conversation-holding upstream"))
@@ -177,7 +189,8 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}
 	req := soma.Request{Model: body.Request.Model, System: body.Request.System, Messages: body.Request.Messages,
-		Thinking: body.Request.Thinking, SessionID: body.Request.SessionID, Epoch: body.Request.Epoch}
+		Thinking: body.Request.Thinking, SessionID: body.Request.SessionID, Epoch: body.Request.Epoch,
+		LoadBlob: s.blobs.loader(body.Blobs)}
 	for _, tool := range body.Request.Tools {
 		req.Tools = append(req.Tools, soma.ToolSpec{Name: tool.Name, Description: tool.Description, Schema: tool.Schema})
 	}
