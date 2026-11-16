@@ -46,7 +46,7 @@ type ProviderConfig struct {
 
 // NeedsCatalog reports whether the provider's models come from its live model list.
 func (p ProviderConfig) NeedsCatalog() bool {
-	return p.API == "openai-chat" && len(p.Models) == 0
+	return (p.API == "openai-chat" || p.API == "soma") && len(p.Models) == 0
 }
 
 type Config struct {
@@ -100,11 +100,18 @@ func (c *Config) Model(ref string) (ProviderConfig, ModelInfo, error) {
 			break
 		}
 	}
-	if !found && p.NeedsCatalog() {
+	if !found && p.NeedsCatalog() || p.API == "soma" {
 		if cat, ok := LoadCatalog(c.Root, name); ok {
 			for _, cached := range cat.Models {
 				if cached.ID == id {
-					listed = cached
+					if found {
+						if len(cached.Thinking) > 0 && cached.Reasoning == nil {
+							m.Reasoning = nil
+						}
+						m = m.override(cached)
+					} else {
+						listed = cached
+					}
 					break
 				}
 			}

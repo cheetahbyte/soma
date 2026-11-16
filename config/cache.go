@@ -13,9 +13,10 @@ import (
 
 // Catalog is a provider's cached live model list.
 type Catalog struct {
-	Fetched time.Time   `json:"fetched"`
-	Error   string      `json:"error,omitempty"` // set when the fetch failed; Models is then empty
-	Models  []ModelInfo `json:"models"`
+	HoldsConversation bool        `json:"holdsConversation,omitempty"`
+	Fetched           time.Time   `json:"fetched"`
+	Error             string      `json:"error,omitempty"` // set when the fetch failed; Models is then empty
+	Models            []ModelInfo `json:"models"`
 }
 
 const (
