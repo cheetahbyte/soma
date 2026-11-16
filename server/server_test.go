@@ -57,7 +57,11 @@ type gateway struct {
 
 func startGateway(t *testing.T, pc config.ProviderConfig, o server.Options) *gateway {
 	t.Helper()
-	root := t.TempDir()
+	return startGatewayAt(t, t.TempDir(), pc, o)
+}
+
+func startGatewayAt(t *testing.T, root string, pc config.ProviderConfig, o server.Options) *gateway {
+	t.Helper()
 	pc.Name = "test"
 	data, err := json.Marshal(struct {
 		Providers map[string]config.ProviderConfig `json:"providers"`
@@ -411,6 +415,7 @@ func TestAuthenticationGuardsEveryRoute(t *testing.T) {
 		{http.MethodPost, "/v1/endrun"},
 		{http.MethodPost, "/v1/abort"},
 		{http.MethodPut, "/v1/blobs/hash"},
+		{http.MethodGet, "/v1/usage"},
 	} {
 		res := rawRequest(t, g, route.method, route.path, `{}`, strconv.Itoa(wire.Version), "wrong")
 		if res.StatusCode != http.StatusUnauthorized {
@@ -1502,5 +1507,312 @@ func TestReloadKeepsAbandonMark(t *testing.T) {
 	starts := c.starts(t)
 	if len(starts) != 2 || resumes(starts[1]) {
 		t.Fatalf("a reload must not let the retry of an abandoned run resume it; starts = %+v", starts)
+	}
+}
+
+func usagePage(t *testing.T, g *gateway, after string) wire.Usage {
+	t.Helper()
+	path := "/v1/usage"
+	if after != "" {
+		path += "?after=" + after
+	}
+	res := rawRequest(t, g, http.MethodGet, path, "", strconv.Itoa(wire.Version), token)
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("GET %s: status %d, %s", path, res.StatusCode, body)
+	}
+	var u wire.Usage
+	if err := json.NewDecoder(res.Body).Decode(&u); err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+func seqs(u wire.Usage) []int64 {
+	var out []int64
+	for _, e := range u.Entries {
+		out = append(out, e.Seq)
+	}
+	return out
+}
+
+func steps(n int) []testmodel.Step {
+	out := make([]testmodel.Step, n)
+	for i := range out {
+		out[i] = testmodel.Step{Text: "secret reply", InputTokens: 100 + i}
+	}
+	return out
+}
+
+func requests(t *testing.T, g *gateway, n int) {
+	t.Helper()
+	p, _, _ := remote(t, g, token)
+	for range n {
+		if _, _, err := call(t, p, request()); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUsageLogRecordsCompletedRequest(t *testing.T) {
+	model := testmodel.Start([]testmodel.Step{{Text: "secret reply", InputTokens: 120}})
+	defer model.Close()
+	g := startGateway(t, modelConfig(model.URL), server.Options{})
+	before := time.Now().UTC().Add(-time.Second)
+	requests(t, g, 1)
+	u := usagePage(t, g, "")
+	if len(u.ID) < 16 || u.First != 1 || u.Next != 1 || len(u.Entries) != 1 {
+		t.Fatalf("usage = %+v, want one entry with seq 1", u)
+	}
+	e := u.Entries[0]
+	if e.Seq != 1 || e.Upstream != "test" || e.API != "openai-responses" || e.Model != "m" || e.SessionID != "session" ||
+		e.Usage.Input != 120 || e.Usage.Output != 10 || e.Usage.Cost <= 0 || e.StopReason != soma.StopEnd ||
+		e.Time.Location() != time.UTC || e.Time.Before(before) || e.Time.After(time.Now().Add(time.Second)) {
+		t.Fatalf("entry = %+v", e)
+	}
+	path := filepath.Join(g.cfg.Root, "usage.jsonl")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("usage log mode = %v, want 0600", info.Mode().Perm())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("secret")) || bytes.Contains(data, []byte("hello")) || bytes.Contains(data, []byte("system")) {
+		t.Fatalf("usage log holds message content: %s", data)
+	}
+	t.Logf("usage.jsonl:\n%s", data)
+	res := rawRequest(t, g, http.MethodGet, "/v1/usage", "", strconv.Itoa(wire.Version), token)
+	body, _ := io.ReadAll(res.Body)
+	t.Logf("GET /v1/usage: %s", body)
+}
+
+type abortingProvider struct{}
+
+func init() {
+	provider.Register("test-aborting", func(*config.Config, config.ProviderConfig) (soma.Provider, error) {
+		return abortingProvider{}, nil
+	})
+}
+
+func (abortingProvider) Stream(ctx context.Context, _ soma.Request, onDelta func(soma.Delta)) (soma.Message, error) {
+	onDelta(soma.Delta{Kind: soma.DeltaText, Text: "par"})
+	<-ctx.Done()
+	return soma.Message{Role: soma.RoleAssistant, Blocks: []soma.Block{{Type: soma.BlockText, Text: "par"}},
+		Usage: &soma.Usage{Input: 7, CacheRead: 3}, StopReason: soma.StopAborted}, ctx.Err()
+}
+
+// The model fakes report no usage for a reply cut short, so a provider
+// registered here stands in for one that does.
+func TestUsageLogRecordsAbortedRequest(t *testing.T) {
+	g := startGateway(t, config.ProviderConfig{API: "test-aborting", Models: []config.ModelInfo{{ID: "m", ContextWindow: 1000}}}, server.Options{})
+	p, _, _ := remote(t, g, token)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err := p.Stream(ctx, request(), func(d soma.Delta) {
+		if d.Text == "par" {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("aborted stream error = %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		u := usagePage(t, g, "")
+		if len(u.Entries) == 1 {
+			e := u.Entries[0]
+			if e.StopReason != soma.StopAborted || e.Usage.Input != 7 || e.Usage.CacheRead != 3 || e.API != "test-aborting" {
+				t.Fatalf("aborted entry = %+v", e)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no usage entry for the aborted request: %+v", u)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestUsageLogSkipsReplyWithoutUsage(t *testing.T) {
+	g := startGateway(t, config.ProviderConfig{API: "test-holder", Models: []config.ModelInfo{{ID: "m", ContextWindow: 1000}}}, server.Options{})
+	p, _, _ := remote(t, g, token)
+	req := request()
+	req.Tools = nil
+	if _, _, err := call(t, p, req); err != nil {
+		t.Fatal(err)
+	}
+	if u := usagePage(t, g, ""); len(u.Entries) != 0 || u.First != 0 || u.Next != 0 {
+		t.Fatalf("usage = %+v, want no entry for a reply without usage", u)
+	}
+}
+
+func TestUsageNeedsToken(t *testing.T) {
+	g := startGateway(t, modelConfig("http://127.0.0.1:1"), server.Options{})
+	for _, key := range []string{"", "wrong"} {
+		res := rawRequest(t, g, http.MethodGet, "/v1/usage", "", strconv.Itoa(wire.Version), key)
+		if res.StatusCode != http.StatusUnauthorized {
+			t.Errorf("token %q: status %d", key, res.StatusCode)
+		}
+	}
+	if res := rawRequest(t, g, http.MethodGet, "/v1/usage", "", "", token); res.StatusCode != http.StatusUpgradeRequired {
+		t.Errorf("without a protocol version: status %d", res.StatusCode)
+	}
+}
+
+func TestUsagePagesAfter(t *testing.T) {
+	model := testmodel.Start(steps(3))
+	defer model.Close()
+	g := startGateway(t, modelConfig(model.URL), server.Options{})
+	requests(t, g, 3)
+	for _, c := range []struct {
+		after string
+		want  []int64
+		next  int64
+	}{
+		{"", []int64{1, 2, 3}, 3},
+		{"0", []int64{1, 2, 3}, 3},
+		{"1", []int64{2, 3}, 3},
+		{"3", nil, 3},
+	} {
+		u := usagePage(t, g, c.after)
+		if !slices.Equal(seqs(u), c.want) || u.Next != c.next || u.First != 1 || u.Entries == nil {
+			t.Errorf("after %q: seqs %v, first %d, next %d; want %v, 1, %d", c.after, seqs(u), u.First, u.Next, c.want, c.next)
+		}
+	}
+	if u := usagePage(t, g, "1"); u.Entries[0].Usage.Input != 101 || u.Entries[1].Usage.Input != 102 {
+		t.Fatalf("entries out of order: %+v", u.Entries)
+	}
+}
+
+func TestUsageBadAfter(t *testing.T) {
+	g := startGateway(t, modelConfig("http://127.0.0.1:1"), server.Options{})
+	for _, after := range []string{"x", "-1", "1.5", "99999999999999999999"} {
+		res := rawRequest(t, g, http.MethodGet, "/v1/usage?after="+after, "", strconv.Itoa(wire.Version), token)
+		if res.StatusCode != http.StatusBadRequest {
+			t.Errorf("after %q: status %d", after, res.StatusCode)
+		}
+	}
+}
+
+func TestUsageClientAheadOfLog(t *testing.T) {
+	model := testmodel.Start(steps(2))
+	defer model.Close()
+	g := startGateway(t, modelConfig(model.URL), server.Options{})
+	if u := usagePage(t, g, "5"); u.ID == "" || u.First != 0 || u.Next != 0 || len(u.Entries) != 0 {
+		t.Fatalf("empty log, after 5: %+v", u)
+	}
+	requests(t, g, 2)
+	if u := usagePage(t, g, "5"); u.First != 1 || u.Next != 2 || len(u.Entries) != 0 {
+		t.Fatalf("after 5 with newest 2: %+v", u)
+	}
+}
+
+func TestUsageResponseCapped(t *testing.T) {
+	root := t.TempDir()
+	var log bytes.Buffer
+	log.WriteString(`{"id":"0123456789abcdef0123456789abcdef"}` + "\n")
+	const n = 3000
+	long := strings.Repeat("s", 1000)
+	for i := 1; i <= n; i++ {
+		line, err := json.Marshal(wire.UsageEntry{Seq: int64(i), Time: time.Now().UTC(), Upstream: "test", API: "openai-responses", Model: "m", SessionID: long, Usage: soma.Usage{Input: i}, StopReason: soma.StopEnd})
+		if err != nil {
+			t.Fatal(err)
+		}
+		log.Write(line)
+		log.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(root, "usage.jsonl"), log.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	g := startGatewayAt(t, root, modelConfig("http://127.0.0.1:1"), server.Options{})
+	var got []int64
+	after, pages := int64(0), 0
+	for after < n {
+		res := rawRequest(t, g, http.MethodGet, "/v1/usage?after="+strconv.FormatInt(after, 10), "", strconv.Itoa(wire.Version), token)
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(body) > 1<<20+4096 {
+			t.Fatalf("page of %d bytes exceeds the cap", len(body))
+		}
+		var u wire.Usage
+		if err := json.Unmarshal(body, &u); err != nil {
+			t.Fatal(err)
+		}
+		if u.ID != "0123456789abcdef0123456789abcdef" || u.First != 1 || len(u.Entries) == 0 || u.Next != u.Entries[len(u.Entries)-1].Seq {
+			t.Fatalf("page after %d: id %q, first %d, next %d, %d entries", after, u.ID, u.First, u.Next, len(u.Entries))
+		}
+		got = append(got, seqs(u)...)
+		after = u.Next
+		pages++
+	}
+	if pages < 3 || len(got) != n || got[0] != 1 || got[n-1] != n {
+		t.Fatalf("%d pages, %d entries", pages, len(got))
+	}
+	for i, s := range got {
+		if s != int64(i+1) {
+			t.Fatalf("entry %d has seq %d", i, s)
+		}
+	}
+}
+
+func TestUsageLogTrimmed(t *testing.T) {
+	model := testmodel.Start(steps(21))
+	defer model.Close()
+	const limit = 2000
+	g := startGateway(t, modelConfig(model.URL), server.Options{UsageLogBytes: limit})
+	requests(t, g, 1)
+	id := usagePage(t, g, "").ID
+	requests(t, g, 19)
+	info, err := os.Stat(filepath.Join(g.cfg.Root, "usage.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > limit || info.Mode().Perm() != 0600 {
+		t.Fatalf("usage log is %d bytes, mode %v; limit %d", info.Size(), info.Mode().Perm(), limit)
+	}
+	u := usagePage(t, g, "")
+	if u.ID != id || u.First <= 1 || u.Next != 20 || len(u.Entries) == 0 || u.Entries[0].Seq != u.First {
+		t.Fatalf("after trimming: id %q (was %q), first %d, next %d, seqs %v", u.ID, id, u.First, u.Next, seqs(u))
+	}
+	for i, e := range u.Entries {
+		if e.Seq != u.First+int64(i) || e.Usage.Input != 100+int(e.Seq)-1 {
+			t.Fatalf("after trimming: entry %d = %+v", i, e)
+		}
+	}
+	requests(t, g, 1)
+	if u := usagePage(t, g, "20"); !slices.Equal(seqs(u), []int64{21}) || u.ID != id {
+		t.Fatalf("after trimming the next seq is %v, id %q", seqs(u), u.ID)
+	}
+}
+
+func TestUsageLogSurvivesRestart(t *testing.T) {
+	model := testmodel.Start(steps(3))
+	defer model.Close()
+	root := t.TempDir()
+	first := startGatewayAt(t, root, modelConfig(model.URL), server.Options{})
+	requests(t, first, 1)
+	id := usagePage(t, first, "").ID
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := first.s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first.srv.Close()
+	again := startGatewayAt(t, root, modelConfig(model.URL), server.Options{})
+	requests(t, again, 1)
+	if u := usagePage(t, again, ""); u.ID != id || !slices.Equal(seqs(u), []int64{1, 2}) {
+		t.Fatalf("after a restart: id %q (was %q), seqs %v", u.ID, id, seqs(u))
+	}
+	fresh := startGateway(t, modelConfig(model.URL), server.Options{})
+	requests(t, fresh, 1)
+	if u := usagePage(t, fresh, ""); u.ID == "" || u.ID == id || !slices.Equal(seqs(u), []int64{1}) {
+		t.Fatalf("on a fresh root: id %q (other %q), seqs %v", u.ID, id, seqs(u))
 	}
 }

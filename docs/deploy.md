@@ -10,10 +10,12 @@ The `Dockerfile` builds `cmd/soma` from source and installs Node.js and Claude C
 
 | Variable | Value | Meaning |
 | --- | --- | --- |
-| `SOMA_HOME` | `/data/soma` | The root: `models.json`, `auth.json`, caches, and the Tailscale state in `tailscale/`. |
+| `SOMA_HOME` | `/data/soma` | The root: `models.json`, `auth.json`, caches, the usage log `usage.jsonl`, and the Tailscale state in `tailscale/`. |
 | `HOME` | `/data/home` | Claude's home directory, so its login and conversation files persist. |
 
 Both paths sit under `/data`, so one volume keeps everything. Losing the volume loses the ChatGPT login, because the stored refresh token was the only valid one. Nothing copies a login between machines.
+
+`/data/soma/usage.jsonl` records the token usage of every request the server serves: upstream, model, session id, token counts, cost, and stop reason, never message content. It stays under 16 MiB by dropping its oldest lines. A script holding `SOMA_TOKEN` pulls it with `GET /v1/usage?after=<seq>`, for example to feed toktrack on a Mac.
 
 Build and check the image locally, if Docker is available:
 

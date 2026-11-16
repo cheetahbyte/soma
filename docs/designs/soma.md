@@ -196,7 +196,7 @@ Agreed with the owner on 2026-11-16. No test uses real keys, paid APIs, or anyth
 - WebSocket transport.
 - Spending caps and per-request budgets.
 - A longer retry budget for soma network errors.
-- Usage reporting for toktrack. The owner deferred it on 2026-11-16. The design considered was one usage line per completed request, written where the provider runs, in the shape toktrack reads through its `pi_dir` setting. Until then the owner's existing mirror script keeps reporting local sessions, and Claude requests served by a soma server are not reported.
+- Usage reporting for toktrack inside soma. Instead, the server keeps a bounded usage log, `<root>/usage.jsonl`, with one line per provider call that reported tokens and no message content, and serves it on the authenticated `GET /v1/usage?after=<seq>`. A script on the owner's Mac pulls it and feeds toktrack, beside the existing mirror script for local sessions; nothing in soma's `client` or in axon calls the route.
 - One setting that makes all of a server's providers appear in axon at once.
 - Release binaries for soma. The image builds from source.
 

@@ -33,6 +33,7 @@ type Options struct {
 	KeepAlive      time.Duration
 	Grace          time.Duration
 	BlobCacheBytes int64
+	UsageLogBytes  int64
 }
 
 type Server struct {
@@ -42,6 +43,7 @@ type Server struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	blobs  *blobStore
+	usage  *usageLog
 
 	loadMu sync.Mutex
 	cfg    *config.Config
@@ -99,6 +101,9 @@ func New(o Options) (*Server, error) {
 	if o.BlobCacheBytes <= 0 {
 		o.BlobCacheBytes = 512 << 20
 	}
+	if o.UsageLogBytes <= 0 {
+		o.UsageLogBytes = 16 << 20
+	}
 	st := readStamp(o.Root)
 	cfg, err := load(o.Root)
 	if err != nil {
@@ -111,13 +116,14 @@ func New(o Options) (*Server, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{o: o, cfg: cfg, stamp: st, mux: http.NewServeMux(), ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		blobs: newBlobStore(o.Root, o.BlobCacheBytes), providers: map[string]soma.Provider{}, runs: map[runKey]*run{},
+		blobs: newBlobStore(o.Root, o.BlobCacheBytes), usage: newUsageLog(o.Root, o.UsageLogBytes), providers: map[string]soma.Provider{}, runs: map[runKey]*run{},
 		pending: map[runKey]bool{}, streams: map[string]*live{}}
 	s.mux.HandleFunc("POST /v1/stream", s.stream)
 	s.mux.HandleFunc("POST /v1/abort", s.abort)
 	s.mux.HandleFunc("POST /v1/endrun", s.endRun)
 	s.mux.HandleFunc("GET /v1/info", s.info)
 	s.mux.HandleFunc("PUT /v1/blobs/{sha256}", s.putBlob)
+	s.mux.HandleFunc("GET /v1/usage", s.getUsage)
 	return s, nil
 }
 
@@ -312,6 +318,9 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		}
 		m, err := p.Stream(ctx, req, func(d soma.Delta) { send(wire.Line{Delta: &wire.Delta{Kind: string(d.Kind), Text: d.Text}}) })
 		streamErr = err
+		if hasTokens(m.Usage) {
+			s.usage.record(usageEntry(body.Upstream, pc.API, req, m))
+		}
 		send(wire.Line{Done: true, Message: &m, Error: encodeError(err, true)})
 	}()
 	delivered := false

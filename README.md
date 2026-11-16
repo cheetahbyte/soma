@@ -66,6 +66,10 @@ Set `SOMA_TOKEN` to the server's token. `upstream` defaults to the entry's name.
 
 Streaming replies preserve deltas, messages, usage, and provider error kinds. The client treats quiet or incomplete streams as network errors. Abort recovery requires a later implementation task.
 
+The server appends one line to `<root>/usage.jsonl` for each provider call whose reply reports tokens, including aborted calls and replies that never reached the asking side. A line holds `seq`, `time`, `upstream`, `api`, `model`, `sessionId`, `usage`, and `stopReason`, never message content. The file's first line, `{"id":...}`, names the log; a new log gets a new id and starts again at `seq` 1. When the file grows past `Options.UsageLogBytes` (default 16 MiB), the server keeps the newest lines that fit in half of it.
+
+`GET /v1/usage?after=<seq>` returns `{"id","first","next","entries"}`: the lines with a `seq` above `after` (default 0), about 1 MiB at most per response. `next` is the last `seq` returned, or `after` when none is; a client ahead of the log gets the newest `seq` instead. `first` is the oldest `seq` still kept, so a client can tell that lines were trimmed past its position. Soma's `client` package doesn't call this route.
+
 ## The program
 
 The `soma` command lives in the nested module `cmd/soma`, the only module that requires `tailscale.com`. The repository's `go.work` joins both modules. Build it from the repository root:
@@ -83,7 +87,7 @@ Commands:
 
 Environment:
 
-- `SOMA_HOME`: the root holding `models.json`, `auth.json`, and the caches. Defaults to `~/.soma`.
+- `SOMA_HOME`: the root holding `models.json`, `auth.json`, the caches, and the usage log `usage.jsonl`. Defaults to `~/.soma`.
 - `SOMA_TOKEN`: the bearer token every request must carry.
 - `TS_AUTHKEY`: optional Tailscale auth key.
 

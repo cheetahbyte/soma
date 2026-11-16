@@ -2,6 +2,7 @@ package wire
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/cheetahbyte/soma"
 	"github.com/cheetahbyte/soma/config"
@@ -71,4 +72,22 @@ type EndRun struct {
 type Info struct {
 	HoldsConversation bool               `json:"holdsConversation"`
 	Models            []config.ModelInfo `json:"models"`
+}
+
+type UsageEntry struct {
+	Seq        int64           `json:"seq"`
+	Time       time.Time       `json:"time"`
+	Upstream   string          `json:"upstream"`
+	API        string          `json:"api"`
+	Model      string          `json:"model"`
+	SessionID  string          `json:"sessionId"`
+	Usage      soma.Usage      `json:"usage"`
+	StopReason soma.StopReason `json:"stopReason"`
+}
+
+type Usage struct {
+	ID      string       `json:"id"`
+	First   int64        `json:"first"`
+	Next    int64        `json:"next"`
+	Entries []UsageEntry `json:"entries"`
 }
