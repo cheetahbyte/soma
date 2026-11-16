@@ -50,12 +50,13 @@ type Provider struct {
 	allowExtra bool
 	info       func(id string) config.ModelInfo // nil: no prices, so no estimate before a turn ends
 
-	mu    sync.Mutex
-	procs map[string]*proc
+	mu      sync.Mutex
+	procs   map[string]*proc
+	restart map[string]bool
 }
 
 func New(name, command string, allowExtraUsage bool) *Provider {
-	return &Provider{name: name, command: command, allowExtra: allowExtraUsage, procs: map[string]*proc{}}
+	return &Provider{name: name, command: command, allowExtra: allowExtraUsage, procs: map[string]*proc{}, restart: map[string]bool{}}
 }
 
 func (p *Provider) HoldsConversation() bool { return true }
@@ -69,6 +70,28 @@ func (p *Provider) EndRun(sessionID string) {
 	if pr != nil {
 		pr.stop()
 	}
+}
+
+// Abandon ends the process of the session and makes its next run start a new
+// conversation from the request's messages, once: the conversation may hold
+// a turn the asking side never recorded.
+func (p *Provider) Abandon(sessionID string) {
+	p.mu.Lock()
+	pr := p.procs[sessionID]
+	delete(p.procs, sessionID)
+	p.restart[sessionID] = true
+	p.mu.Unlock()
+	if pr != nil {
+		pr.stop()
+	}
+}
+
+func (p *Provider) takeRestart(id string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r := p.restart[id]
+	delete(p.restart, id)
+	return r
 }
 
 func (p *Provider) get(id string) *proc {
@@ -107,6 +130,9 @@ func (p *Provider) Stream(ctx context.Context, req soma.Request, onDelta func(so
 		}
 	}
 	pl := decide(p.name, req)
+	if p.takeRestart(req.SessionID) {
+		pl = newConversation(req.Messages)
+	}
 	if pr != nil && !(pr.alive() && pl.Resume != "" && pl.Resume == pr.sessionID && pr.sameSetup(req)) {
 		p.drop(req.SessionID, pr)
 		pr = nil

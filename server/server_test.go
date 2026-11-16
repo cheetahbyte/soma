@@ -17,9 +17,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -28,13 +30,22 @@ import (
 	"github.com/cheetahbyte/soma/config"
 	"github.com/cheetahbyte/soma/provider"
 	"github.com/cheetahbyte/soma/server"
+	testclaude "github.com/cheetahbyte/soma/somatest/claude"
 	testmodel "github.com/cheetahbyte/soma/somatest/model"
 	"github.com/cheetahbyte/soma/wire"
 )
 
 const token = "local-test-token"
 
+func TestMain(m *testing.M) {
+	if os.Getenv("SOMA_TEST_FAKE_CLAUDE") == "1" {
+		os.Exit(testclaude.Run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	}
+	os.Exit(m.Run())
+}
+
 type gateway struct {
+	s   *server.Server
 	srv *httptest.Server
 	cfg *config.Config
 	pc  config.ProviderConfig
@@ -71,7 +82,7 @@ func startGateway(t *testing.T, pc config.ProviderConfig, o server.Options) *gat
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &gateway{srv: h, cfg: cfg, pc: cfg.Providers["test"]}
+	return &gateway{s: s, srv: h, cfg: cfg, pc: cfg.Providers["test"]}
 }
 
 func modelConfig(baseURL string) config.ProviderConfig {
@@ -854,5 +865,313 @@ func TestAbortUnknownStream(t *testing.T) {
 	err := json.NewDecoder(res.Body).Decode(&e)
 	if res.StatusCode != http.StatusNotFound || err != nil || !strings.Contains(e.Message, "no-such-stream") {
 		t.Fatalf("abort of an unknown stream: status %d, %+v, %v", res.StatusCode, e, err)
+	}
+}
+
+type fakeClaude struct {
+	command, log string
+}
+
+// newClaude writes a wrapper named claude that runs this test binary as the
+// fake claude program with the given script. GORACE keeps a race-enabled
+// fake from sleeping a second before it exits.
+func newClaude(t *testing.T, script string) *fakeClaude {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	c := &fakeClaude{command: filepath.Join(dir, "claude"), log: filepath.Join(dir, "claude.log")}
+	scriptPath := filepath.Join(dir, "script.json")
+	if err := os.WriteFile(scriptPath, []byte(script), 0600); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := "#!/bin/sh\nGORACE=atexit_sleep_ms=0 SOMA_TEST_FAKE_CLAUDE=1 TESTCLAUDE_LOG=" + strconv.Quote(c.log) + " TESTCLAUDE_SCRIPT=" + strconv.Quote(scriptPath) + " exec " + strconv.Quote(self) + " \"$@\"\n"
+	if err := os.WriteFile(c.command, []byte(wrapper), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func (c *fakeClaude) config() config.ProviderConfig {
+	return config.ProviderConfig{API: "claude-code", Command: c.command, Models: []config.ModelInfo{{ID: "m", ContextWindow: 200000}}}
+}
+
+type claudeStart struct {
+	Pid  int      `json:"pid"`
+	Args []string `json:"args"`
+}
+
+func (c *fakeClaude) starts(t *testing.T) []claudeStart {
+	t.Helper()
+	data, err := os.ReadFile(c.log)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	var out []claudeStart
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		var rec struct {
+			Event string `json:"event"`
+			claudeStart
+		}
+		if len(line) == 0 || json.Unmarshal(line, &rec) != nil || rec.Event != "start" {
+			continue
+		}
+		out = append(out, rec.claudeStart)
+	}
+	return out
+}
+
+func running(pid int) bool { return syscall.Kill(pid, 0) == nil }
+
+func waitGone(t *testing.T, pid int, limit time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	for running(pid) {
+		if time.Now().After(deadline) {
+			t.Fatalf("fake claude process %d still runs after %v", pid, limit)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func userMessage(text string) soma.Message {
+	return soma.Message{Role: soma.RoleUser, Blocks: []soma.Block{{Type: soma.BlockText, Text: text}}}
+}
+
+// stamped is a reply as the session log keeps it: under the entry's name.
+func stamped(m soma.Message) soma.Message {
+	m.Provider = "home"
+	return m
+}
+
+// streamBody is the body the client would send for req, with the entry's
+// name already replaced by the upstream's.
+func streamBody(t *testing.T, req soma.Request, afterFailed bool) []byte {
+	t.Helper()
+	messages := slices.Clone(req.Messages)
+	for i := range messages {
+		if messages[i].Provider == "home" {
+			messages[i].Provider = "test"
+		}
+	}
+	tools := make([]wire.Tool, len(req.Tools))
+	for i, tool := range req.Tools {
+		tools[i] = wire.Tool{Name: tool.Name, Description: tool.Description, Schema: tool.Schema}
+	}
+	body, err := json.Marshal(wire.StreamRequest{Upstream: "test", AfterFailedStream: afterFailed, Request: wire.Request{Model: req.Model, System: req.System,
+		Messages: messages, Tools: tools, Thinking: req.Thinking, SessionID: req.SessionID, Epoch: req.Epoch}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// dropStream sends req as raw stream request, reads until a text delta with
+// text, then closes the connection without an abort request.
+func dropStream(t *testing.T, g *gateway, req soma.Request, text string) {
+	t.Helper()
+	body := streamBody(t, req, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, g.srv.URL+"/v1/stream", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hreq.Header.Set("Authorization", "Bearer "+token)
+	hreq.Header.Set(wire.HeaderProtocol, strconv.Itoa(wire.Version))
+	res, err := (&http.Client{Transport: &http.Transport{}}).Do(hreq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	scan := bufio.NewScanner(res.Body)
+	for scan.Scan() {
+		var line wire.Line
+		if err := json.Unmarshal(scan.Bytes(), &line); err != nil {
+			t.Fatal(err)
+		}
+		if line.Done {
+			t.Fatalf("stream ended before it could be dropped: %+v", line)
+		}
+		if line.Delta != nil && line.Delta.Text == text {
+			return
+		}
+	}
+	t.Fatalf("stream ended without the delta %q: %v", text, scan.Err())
+}
+
+func resumes(s claudeStart) bool { return slices.Contains(s.Args, "--resume") }
+
+func TestDroppedStreamStartsNewConversation(t *testing.T) {
+	c := newClaude(t, `{"turns":[[{"text":["first"]}],[{"text":["par"],"hang":true}]]}`)
+	g := startGateway(t, c.config(), server.Options{})
+	p, _, _ := remote(t, g, token)
+	req := request()
+	first, _, err := call(t, p, req)
+	if err != nil || first.Text() != "first" {
+		t.Fatalf("first reply = %+v, %v", first, err)
+	}
+	req.Messages = append(req.Messages, stamped(first), userMessage("continue"))
+	dropStream(t, g, req, "par")
+	retry, _, err := call(t, p, req)
+	if err != nil || retry.Text() != "ok" {
+		t.Fatalf("retry = %+v, %v", retry, err)
+	}
+	starts := c.starts(t)
+	if len(starts) != 2 || resumes(starts[0]) || resumes(starts[1]) {
+		t.Fatalf("after a dropped stream the retry must start a new conversation; starts = %+v", starts)
+	}
+}
+
+func TestAfterFailedStreamFlag(t *testing.T) {
+	c := newClaude(t, `{}`)
+	first := startGateway(t, c.config(), server.Options{})
+	p, _, _ := remote(t, first, token)
+	req := request()
+	reply, _, err := call(t, p, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Messages = append(req.Messages, stamped(reply), userMessage("continue"))
+	fresh := startGateway(t, c.config(), server.Options{})
+	body := streamBody(t, req, true)
+	res := rawRequest(t, fresh, http.MethodPost, "/v1/stream", string(body), strconv.Itoa(wire.Version), token)
+	data, err := io.ReadAll(res.Body)
+	if err != nil || res.StatusCode != http.StatusOK || !bytes.Contains(data, []byte(`"done":true`)) || bytes.Contains(data, []byte(`"error"`)) {
+		t.Fatalf("stream after a failed one: status %d, %s, %v", res.StatusCode, data, err)
+	}
+	starts := c.starts(t)
+	if len(starts) != 2 || resumes(starts[1]) {
+		t.Fatalf("a request marked as following a failed stream must start a new conversation; starts = %+v", starts)
+	}
+}
+
+func TestAbortDoesNotAbandon(t *testing.T) {
+	c := newClaude(t, `{"turns":[[{"text":["first"]}],[{"text":["par"],"hang":true}]]}`)
+	g := startGateway(t, c.config(), server.Options{})
+	p, cfg, pc := remote(t, g, token)
+	if _, err := provider.FetchModels(context.Background(), cfg, pc); err != nil {
+		t.Fatal(err)
+	}
+	req := request()
+	first, _, err := call(t, p, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Messages = append(req.Messages, stamped(first), userMessage("continue"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	partial, err := p.Stream(ctx, req, func(d soma.Delta) {
+		if d.Kind == soma.DeltaText && d.Text == "par" {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) || partial.Text() != "par" {
+		t.Fatalf("aborted reply = %+v, %v", partial, err)
+	}
+	p.(soma.RunEnder).EndRun(req.SessionID)
+	req.Messages = append(req.Messages, stamped(partial), userMessage("go on"))
+	if _, _, err := call(t, p, req); err != nil {
+		t.Fatal(err)
+	}
+	starts := c.starts(t)
+	if len(starts) != 2 || !resumes(starts[1]) {
+		t.Fatalf("after an abort the next request must resume the conversation; starts = %+v", starts)
+	}
+}
+
+func TestGraceEndsHeldProcess(t *testing.T) {
+	c := newClaude(t, `{}`)
+	g := startGateway(t, c.config(), server.Options{Grace: 50 * time.Millisecond})
+	p, _, _ := remote(t, g, token)
+	if _, _, err := call(t, p, request()); err != nil {
+		t.Fatal(err)
+	}
+	starts := c.starts(t)
+	if len(starts) != 1 {
+		t.Fatalf("starts = %+v", starts)
+	}
+	waitGone(t, starts[0].Pid, time.Second)
+}
+
+func TestShutdownEndsProcesses(t *testing.T) {
+	c := newClaude(t, `{}`)
+	g := startGateway(t, c.config(), server.Options{})
+	p, _, _ := remote(t, g, token)
+	if _, _, err := call(t, p, request()); err != nil {
+		t.Fatal(err)
+	}
+	starts := c.starts(t)
+	if len(starts) != 1 || !running(starts[0].Pid) {
+		t.Fatalf("no held process before shutdown: %+v", starts)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := g.s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if running(starts[0].Pid) {
+		t.Fatal("Shutdown returned while the held claude process still runs")
+	}
+	_, _, err := call(t, p, request())
+	var pe *soma.ProviderError
+	if !errors.As(err, &pe) || pe.Status != http.StatusServiceUnavailable {
+		t.Fatalf("request to a shut-down handler = %v, want its refusal", err)
+	}
+	g.srv.Close()
+	_, _, err = call(t, p, request())
+	if !errors.As(err, &pe) || pe.Kind != soma.ErrNetwork {
+		t.Fatalf("request after the listener closed = %v, want a connection error", err)
+	}
+	if len(c.starts(t)) != 1 {
+		t.Fatal("a request after shutdown started claude")
+	}
+}
+
+func TestClientMarksRetryAfterFailedStream(t *testing.T) {
+	var mu sync.Mutex
+	var flags []bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body wire.StreamRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		mu.Lock()
+		flags = append(flags, body.AfterFailedStream)
+		n := len(flags)
+		mu.Unlock()
+		w.Header().Set(wire.HeaderProtocol, strconv.Itoa(wire.Version))
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		io.WriteString(w, "{\"stream\":\"id\"}\n")
+		if n != 1 {
+			io.WriteString(w, "{\"done\":true,\"message\":{\"Role\":\"assistant\"}}\n")
+		}
+	}))
+	defer upstream.Close()
+	pc := config.ProviderConfig{Name: "home", API: "soma", BaseURL: upstream.URL, APIKey: token}
+	cfg := &config.Config{Root: t.TempDir(), Providers: map[string]config.ProviderConfig{pc.Name: pc}}
+	p, err := provider.New(cfg, pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = call(t, p, request())
+	var pe *soma.ProviderError
+	if !errors.As(err, &pe) || pe.Kind != soma.ErrNetwork {
+		t.Fatalf("broken stream = %v", err)
+	}
+	for range 2 {
+		if _, _, err := call(t, p, request()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := request()
+	other.SessionID = "other"
+	if _, _, err := call(t, p, other); err != nil {
+		t.Fatal(err)
+	}
+	if want := []bool{false, true, false, false}; !reflect.DeepEqual(flags, want) {
+		t.Fatalf("afterFailedStream per request = %v, want %v", flags, want)
 	}
 }

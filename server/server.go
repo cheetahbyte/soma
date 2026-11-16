@@ -44,8 +44,8 @@ type Server struct {
 	mu        sync.Mutex
 	closed    bool
 	providers map[string]soma.Provider
-	sessions  map[string]map[string]bool
-	streams   map[string]context.CancelFunc
+	runs      map[runKey]*run
+	streams   map[string]*live
 	wg        sync.WaitGroup
 }
 
@@ -71,8 +71,8 @@ func New(o Options) (*Server, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{o: o, cfg: cfg, mux: http.NewServeMux(), ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		blobs: newBlobStore(o.Root, o.BlobCacheBytes), providers: map[string]soma.Provider{}, sessions: map[string]map[string]bool{},
-		streams: map[string]context.CancelFunc{}}
+		blobs: newBlobStore(o.Root, o.BlobCacheBytes), providers: map[string]soma.Provider{}, runs: map[runKey]*run{},
+		streams: map[string]*live{}}
 	s.mux.HandleFunc("POST /v1/stream", s.stream)
 	s.mux.HandleFunc("POST /v1/abort", s.abort)
 	s.mux.HandleFunc("POST /v1/endrun", s.endRun)
@@ -179,18 +179,15 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	tracked := false
 	if h, ok := p.(soma.ConversationHolder); ok && h.HoldsConversation() && len(body.Request.Tools) > 0 {
 		if body.Request.SessionID == "" {
 			writeError(w, http.StatusBadRequest, false, errors.New("soma: sessionId is required for a conversation-holding upstream"))
 			return
 		}
-		s.mu.Lock()
-		if s.sessions[body.Upstream] == nil {
-			s.sessions[body.Upstream] = map[string]bool{}
-		}
-		s.sessions[body.Upstream][body.Request.SessionID] = true
-		s.mu.Unlock()
+		tracked = true
 	}
+	key := runKey{body.Upstream, body.Request.SessionID}
 	req := soma.Request{Model: body.Request.Model, System: body.Request.System, Messages: body.Request.Messages,
 		Thinking: body.Request.Thinking, SessionID: body.Request.SessionID, Epoch: body.Request.Epoch,
 		LoadBlob: s.blobs.loader(body.Blobs)}
@@ -205,8 +202,9 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	stream := hex.EncodeToString(id[:])
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	l := &live{cancel: cancel}
 	s.mu.Lock()
-	s.streams[stream] = cancel
+	s.streams[stream] = l
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -224,9 +222,16 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	if err := write(wire.Line{Stream: stream}); err != nil {
 		return
 	}
+	if tracked {
+		s.begin(key, l)
+		if body.AfterFailedStream {
+			abandon(p, key.session)
+		}
+	}
 	lines := make(chan wire.Line, 64)
 	finished := make(chan struct{})
 	quit := make(chan struct{})
+	var streamErr error
 	go func() {
 		defer close(finished)
 		send := func(line wire.Line) {
@@ -236,15 +241,28 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		m, err := p.Stream(ctx, req, func(d soma.Delta) { send(wire.Line{Delta: &wire.Delta{Kind: string(d.Kind), Text: d.Text}}) })
+		streamErr = err
 		send(wire.Line{Done: true, Message: &m, Error: encodeError(err, true)})
 	}()
-	defer func() { cancel(); close(quit); <-finished }()
+	delivered := false
+	defer func() {
+		cancel()
+		close(quit)
+		<-finished
+		if tracked {
+			s.end(key, l, p, delivered, streamErr)
+		}
+	}()
 	timer := time.NewTimer(s.o.KeepAlive)
 	defer timer.Stop()
 	for {
 		select {
 		case line := <-lines:
-			if err := write(line); err != nil || line.Done {
+			if err := write(line); err != nil {
+				return
+			}
+			if line.Done {
+				delivered = true
 				return
 			}
 			timer.Reset(s.o.KeepAlive)
@@ -266,13 +284,16 @@ func (s *Server) abort(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	cancel := s.streams[body.Stream]
+	l := s.streams[body.Stream]
+	if l != nil {
+		l.aborted = true
+	}
 	s.mu.Unlock()
-	if cancel == nil {
+	if l == nil {
 		writeError(w, http.StatusNotFound, false, fmt.Errorf("soma: stream %q is not in progress", body.Stream))
 		return
 	}
-	cancel()
+	l.cancel()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -338,9 +359,7 @@ func (s *Server) endRun(w http.ResponseWriter, r *http.Request) {
 	if ender, ok := p.(soma.RunEnder); ok {
 		ender.EndRun(body.SessionID)
 	}
-	s.mu.Lock()
-	delete(s.sessions[body.Upstream], body.SessionID)
-	s.mu.Unlock()
+	s.forget(runKey{body.Upstream, body.SessionID})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -381,13 +400,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.cancel()
 		go func() {
 			s.wg.Wait()
-			for name, sessions := range s.sessions {
-				if ender, ok := s.providers[name].(soma.RunEnder); ok {
-					for id := range sessions {
-						ender.EndRun(id)
-					}
-				}
-			}
+			s.endAll()
 			close(s.done)
 		}()
 	}

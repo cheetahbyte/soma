@@ -34,7 +34,8 @@ turn beyond the list is one message `ok`.
 
 A message: `text` (list of chunks, one `text_delta` each), `thinking` (true
 adds an empty thinking block), `calls` (list of `{"name","args"}`; `name` is
-the tool's name on the server, `args` any JSON). A message with calls ends with
+the tool's name on the server, `args` any JSON), `hang` (true stops after the
+text deltas until SIGINT, so a reply stays in progress). A message with calls ends with
 `stop_reason` `tool_use`, one without with `end_turn`. A call whose tool is not
 in `tools/list` is sent anyway. When the server is not connected, calls are
 dropped.

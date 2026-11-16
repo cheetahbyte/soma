@@ -41,6 +41,9 @@ type client struct {
 	http     *http.Client
 	idle     time.Duration
 	infoMu   sync.Mutex
+
+	failMu sync.Mutex
+	failed map[string]bool
 }
 
 func newClient(cfg *config.Config, p config.ProviderConfig) (*client, error) {
@@ -58,7 +61,7 @@ func newClient(cfg *config.Config, p config.ProviderConfig) (*client, error) {
 	}
 	h, idle := httpwire.NewHTTPClient()
 	h.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &client{cfg: cfg, entry: p, baseURL: strings.TrimRight(u.String(), "/"), upstream: upstream, token: token, http: h, idle: idle}, nil
+	return &client{cfg: cfg, entry: p, baseURL: strings.TrimRight(u.String(), "/"), upstream: upstream, token: token, http: h, idle: idle, failed: map[string]bool{}}, nil
 }
 
 func fetchModels(ctx context.Context, cfg *config.Config, p config.ProviderConfig) ([]config.ModelInfo, error) {
@@ -153,7 +156,29 @@ func (c *client) Stream(ctx context.Context, req soma.Request, onDelta func(soma
 	return msg, httpwire.Redact(err, c.token)
 }
 
-func (c *client) stream(ctx context.Context, req soma.Request, onDelta func(soma.Delta)) (soma.Message, error) {
+// markFailed records whether the session's last opened stream broke, so the
+// next request tells the server not to resume a conversation that may hold
+// a turn the session never recorded.
+func (c *client) markFailed(session string, failed bool) {
+	if session == "" {
+		return
+	}
+	c.failMu.Lock()
+	defer c.failMu.Unlock()
+	if failed {
+		c.failed[session] = true
+	} else {
+		delete(c.failed, session)
+	}
+}
+
+func (c *client) failedBefore(session string) bool {
+	c.failMu.Lock()
+	defer c.failMu.Unlock()
+	return c.failed[session]
+}
+
+func (c *client) stream(ctx context.Context, req soma.Request, onDelta func(soma.Delta)) (_ soma.Message, err error) {
 	messages := append([]soma.Message(nil), req.Messages...)
 	for i := range messages {
 		if messages[i].Provider == c.entry.Name {
@@ -165,7 +190,7 @@ func (c *client) stream(ctx context.Context, req soma.Request, onDelta func(soma
 		tools[i] = wire.Tool{Name: tool.Name, Description: tool.Description, Schema: tool.Schema}
 	}
 	blobs, names := hashBlobs(req)
-	body, err := json.Marshal(wire.StreamRequest{Upstream: c.upstream, Blobs: blobs, Request: wire.Request{
+	body, err := json.Marshal(wire.StreamRequest{Upstream: c.upstream, Blobs: blobs, AfterFailedStream: c.failedBefore(req.SessionID), Request: wire.Request{
 		Model: req.Model, System: req.System, Messages: messages, Tools: tools,
 		Thinking: req.Thinking, SessionID: req.SessionID, Epoch: req.Epoch,
 	}})
@@ -209,6 +234,13 @@ func (c *client) stream(ctx context.Context, req soma.Request, onDelta func(soma
 	if res.StatusCode != http.StatusOK {
 		return soma.Message{}, c.responseError(res)
 	}
+	c.markFailed(req.SessionID, false)
+	defer func() {
+		var pe *soma.ProviderError
+		if errors.As(err, &pe) && pe.Kind == soma.ErrNetwork {
+			c.markFailed(req.SessionID, true)
+		}
+	}()
 	contentType, _, err := mime.ParseMediaType(res.Header.Get("Content-Type"))
 	if err != nil || contentType != "application/x-ndjson" {
 		return soma.Message{}, c.networkError(errors.New("expected application/x-ndjson response"))

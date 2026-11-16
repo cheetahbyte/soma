@@ -39,6 +39,7 @@ type message struct {
 	Text     []string `json:"text"`
 	Thinking bool     `json:"thinking"`
 	Calls    []call   `json:"calls"`
+	Hang     bool     `json:"hang"`
 }
 
 type script struct {
@@ -374,6 +375,10 @@ func (s *state) modelMessage(m message) (usage, string) {
 		event(map[string]any{"type": "content_block_start", "index": idx, "content_block": map[string]any{"type": "text", "text": ""}})
 		for _, c := range m.Text {
 			event(map[string]any{"type": "content_block_delta", "index": idx, "delta": map[string]any{"type": "text_delta", "text": c}})
+		}
+		if m.Hang {
+			<-s.ctx.Done()
+			return u, text
 		}
 		assistant(map[string]any{"type": "text", "text": text})
 		event(map[string]any{"type": "content_block_stop", "index": idx})
