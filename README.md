@@ -2,7 +2,7 @@
 
 Soma extracts axon's model access into `github.com/cheetahbyte/soma`, a Go library with no dependencies outside the standard library.
 
-Implementation is in progress. Local providers and basic HTTP streaming are available as libraries. Blob transfer, partial replies on abort, session recovery, configuration reload, and the `soma` command aren't implemented yet.
+Implementation is in progress. Local providers, HTTP streaming, blob transfer, and the `soma` command are available. Partial replies on abort, session recovery, and configuration reload aren't implemented yet.
 
 ## Library
 
@@ -43,11 +43,32 @@ Configure a remote provider in the asking program's `models.json`:
 
 Set `SOMA_TOKEN` to the server's token. `upstream` defaults to the entry's name. Without an explicit model list, call `provider.FetchModels` to discover models and cache the upstream's conversation capability. Explicit model entries retain their overrides while inheriting cached server metadata.
 
-Streaming replies preserve deltas, messages, usage, and provider error kinds. The client treats quiet or incomplete streams as network errors. Blob uploads and abort recovery require later implementation tasks.
+Streaming replies preserve deltas, messages, usage, and provider error kinds. The client treats quiet or incomplete streams as network errors. Abort recovery requires a later implementation task.
+
+## The program
+
+The `soma` command lives in the nested module `cmd/soma`, the only module that requires `tailscale.com`. The repository's `go.work` joins both modules. Build it from the repository root:
+
+```sh
+go build ./cmd/soma
+```
+
+Commands:
+
+- `soma serve [--listen <addr>] [--hostname <name>]` serves the HTTP API on `--listen` (default `127.0.0.1:7662`). It refuses to start, with exit status 2, when `SOMA_TOKEN` is not set. When `TS_AUTHKEY` is set, it also joins the tailnet as `--hostname` (default `soma`) and serves on port 80 there, keeping the Tailscale state in `<root>/tailscale`. On `SIGTERM` or `SIGINT` it shuts down and exits with status 0.
+- `soma login codex` prints the ChatGPT sign-in address and reads back the address the browser was sent to after signing in. It stores the login in the root.
+- `soma login melious --stdin` reads a Melious API key from the first line of standard input, checks it against Melious, and stores it.
+- `soma version` prints the version.
+
+Environment:
+
+- `SOMA_HOME`: the root holding `models.json`, `auth.json`, and the caches. Defaults to `~/.soma`.
+- `SOMA_TOKEN`: the bearer token every request must carry.
+- `TS_AUTHKEY`: optional Tailscale auth key.
 
 ## Checks
 
-Go 1.27 or later is required. Run formatting checks, vet, build, and the local unit tests:
+Go 1.27 or later is required; `cmd/soma` needs Go 1.27.4 or later, the version `tailscale.com` requires. Run formatting checks, vet, build, and the local unit tests for both modules:
 
 ```sh
 ./scripts/check.sh
