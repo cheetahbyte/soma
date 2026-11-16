@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -45,35 +46,19 @@ type loginResult struct {
 // credentials; the caller saves them. It waits for the callback, ctx, or a
 // five-minute deadline that exists only while it runs.
 func LoginCodex(ctx context.Context, o LoginOptions) (Codex, error) {
-	verifier, err := RandomSecret()
+	pk, err := newPKCE()
 	if err != nil {
 		return Codex{}, err
 	}
-	state, err := RandomSecret()
-	if err != nil {
-		return Codex{}, err
-	}
-	sum := sha256.Sum256([]byte(verifier))
-	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	verifier, state := pk.verifier, pk.state
 
 	ln, err := listen(o.Ports)
 	if err != nil {
 		return Codex{}, err
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	redirect := fmt.Sprintf("http://localhost:%d%s", port, callbackPath)
-	authorize := strings.TrimRight(o.Issuer, "/") + "/oauth/authorize?" + url.Values{
-		"response_type":              {"code"},
-		"client_id":                  {clientID},
-		"redirect_uri":               {redirect},
-		"scope":                      {loginScope},
-		"code_challenge":             {challenge},
-		"code_challenge_method":      {"S256"},
-		"state":                      {state},
-		"id_token_add_organizations": {"true"},
-		"codex_cli_simplified_flow":  {"true"},
-		"originator":                 {"harness"},
-	}.Encode()
+	redirect := redirectURL(port)
+	authorize := pk.authorizeURL(o.Issuer, redirect)
 
 	ctx, cancel := context.WithTimeout(ctx, loginLimit)
 	defer cancel()
@@ -112,6 +97,111 @@ func LoginCodex(ctx context.Context, o LoginOptions) (Codex, error) {
 		}
 		return Codex{}, ctx.Err()
 	}
+}
+
+type pkce struct {
+	verifier, state, challenge string
+}
+
+func newPKCE() (pkce, error) {
+	verifier, err := RandomSecret()
+	if err != nil {
+		return pkce{}, err
+	}
+	state, err := RandomSecret()
+	if err != nil {
+		return pkce{}, err
+	}
+	sum := sha256.Sum256([]byte(verifier))
+	return pkce{verifier, state, base64.RawURLEncoding.EncodeToString(sum[:])}, nil
+}
+
+func redirectURL(port int) string {
+	return fmt.Sprintf("http://localhost:%d%s", port, callbackPath)
+}
+
+func (p pkce) authorizeURL(issuer, redirect string) string {
+	return strings.TrimRight(issuer, "/") + "/oauth/authorize?" + url.Values{
+		"response_type":              {"code"},
+		"client_id":                  {clientID},
+		"redirect_uri":               {redirect},
+		"scope":                      {loginScope},
+		"code_challenge":             {p.challenge},
+		"code_challenge_method":      {"S256"},
+		"state":                      {p.state},
+		"id_token_add_organizations": {"true"},
+		"codex_cli_simplified_flow":  {"true"},
+		"originator":                 {"harness"},
+	}.Encode()
+}
+
+// LoginCodexPaste is the login for a machine with no browser: the person
+// signs in elsewhere and pastes the address the browser was sent to.
+func LoginCodexPaste(ctx context.Context, o LoginOptions, in io.Reader, out io.Writer) (Codex, error) {
+	if len(o.Ports) == 0 {
+		return Codex{}, errors.New("no port configured for the ChatGPT sign-in")
+	}
+	pk, err := newPKCE()
+	if err != nil {
+		return Codex{}, err
+	}
+	redirect := redirectURL(o.Ports[0])
+
+	ctx, cancel := context.WithTimeout(ctx, loginLimit)
+	defer cancel()
+	fmt.Fprintf(out, "Open this URL to sign in to ChatGPT:\n%s\n", pk.authorizeURL(o.Issuer, redirect))
+	fmt.Fprintf(out, "After signing in, the browser shows an error page. Paste the address of that page (it starts with %s) and press Enter:\n", redirect)
+
+	type line struct {
+		text string
+		err  error
+	}
+	lines := make(chan line, 1)
+	go func() {
+		text, err := bufio.NewReader(in).ReadString('\n')
+		if err != nil && text == "" {
+			if errors.Is(err, io.EOF) {
+				err = errors.New("no address was pasted")
+			}
+			lines <- line{err: err}
+			return
+		}
+		lines <- line{text: strings.TrimSpace(text)}
+	}()
+	var pasted string
+	select {
+	case l := <-lines:
+		if l.err != nil {
+			return Codex{}, l.err
+		}
+		pasted = l.text
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return Codex{}, fmt.Errorf("the ChatGPT sign-in did not finish within %s", loginLimit)
+		}
+		return Codex{}, ctx.Err()
+	}
+
+	u, err := url.Parse(pasted)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return Codex{}, fmt.Errorf("expected the address the browser was sent to after signing in, starting with %s", redirect)
+	}
+	q := u.Query()
+	if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(pk.state)) != 1 {
+		return Codex{}, errors.New("the pasted address does not belong to this login: its state does not match; run the login again and paste the address from the new sign-in")
+	}
+	if failure := q.Get("error"); failure != "" {
+		msg := clean(failure, nil)
+		if d := clean(q.Get("error_description"), nil); d != "" {
+			msg += ": " + d
+		}
+		return Codex{}, fmt.Errorf("ChatGPT sign-in failed: %s", msg)
+	}
+	code := q.Get("code")
+	if code == "" {
+		return Codex{}, errors.New("the pasted address has no authorization code")
+	}
+	return exchangeCode(ctx, o.Issuer, code, pk.verifier, redirect)
 }
 
 // RandomSecret returns 32 random bytes, base64url encoded, for PKCE verifiers and state.
