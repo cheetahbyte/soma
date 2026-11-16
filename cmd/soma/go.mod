@@ -2,7 +2,10 @@ module github.com/cheetahbyte/soma/cmd/soma
 
 go 1.27.4
 
-require tailscale.com v1.104.7
+require (
+	github.com/cheetahbyte/soma v0.1.0
+	tailscale.com v1.104.7
+)
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
