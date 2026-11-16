@@ -3,7 +3,7 @@ module github.com/cheetahbyte/soma/cmd/soma
 go 1.27.4
 
 require (
-	github.com/cheetahbyte/soma v0.1.0
+	github.com/cheetahbyte/soma v0.1.1
 	tailscale.com v1.104.7
 )
 
