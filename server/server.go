@@ -161,25 +161,25 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r.WithContext(ctx))
 }
 
-// config returns the configuration, loaded again when models.json or
-// auth.json changed since it was loaded. A reload drops the cached providers;
-// a run keeps the provider it started with until it ends.
+// config reloads changed configuration and refreshes opted-in model data when
+// due. Both are serialized so concurrent requests share one catalog fetch.
+// A reload drops cached providers; a run keeps its provider until it ends.
 func (s *Server) config() (*config.Config, error) {
 	s.loadMu.Lock()
 	defer s.loadMu.Unlock()
 	st := readStamp(s.o.Root)
-	if st == s.stamp {
-		return s.cfg, nil
+	if st != s.stamp {
+		cfg, err := load(s.o.Root)
+		if err != nil {
+			return nil, err
+		}
+		s.cfg, s.stamp = cfg, st
+		s.mu.Lock()
+		s.providers = map[string]soma.Provider{}
+		s.mu.Unlock()
 	}
-	cfg, err := load(s.o.Root)
-	if err != nil {
-		return nil, err
-	}
-	s.cfg, s.stamp = cfg, st
-	s.mu.Lock()
-	s.providers = map[string]soma.Provider{}
-	s.mu.Unlock()
-	return cfg, nil
+	config.RefreshModelsDev(s.cfg)
+	return s.cfg, nil
 }
 
 func (s *Server) upstream(name string) (soma.Provider, *config.Config, config.ProviderConfig, int, error) {

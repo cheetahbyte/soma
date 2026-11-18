@@ -66,6 +66,29 @@ Set `SOMA_TOKEN` to the server's token. `upstream` defaults to the entry's name.
 
 Streaming replies preserve deltas, messages, usage, and provider error kinds. The client treats quiet or incomplete streams as network errors. Abort recovery requires a later implementation task.
 
+### Server-side prices
+
+Soma calculates `Usage.Cost` on the server. Configure prices on the server's upstream, not on the asking program's `soma` entry.
+
+To fill missing prices from models.dev, set `modelsDev` on the upstream in the server's `models.json`:
+
+```json
+{
+  "providers": {
+    "chatgpt": {
+      "api": "codex",
+      "modelsDev": "openai"
+    }
+  }
+}
+```
+
+The server refreshes opted-in catalogs before handling upstream requests when data is missing or older than 24 hours. Concurrent requests share the refresh. Failed refreshes preserve older rates and wait 10 minutes before retrying. No polling timer runs while idle.
+
+Explicit model prices take precedence over catalog prices. Without usable prices, replies still report tokens, but cost remains zero. For ChatGPT subscriptions, the cost estimates equivalent API usage, not a subscription charge.
+
+### Usage log
+
 The server appends one line to `<root>/usage.jsonl` for each provider call whose reply reports tokens, including aborted calls and replies that never reached the asking side. A line holds `seq`, `time`, `upstream`, `api`, `model`, `sessionId`, `usage`, and `stopReason`, never message content. The file's first line, `{"id":...}`, names the log; a new log gets a new id and starts again at `seq` 1. When the file grows past `Options.UsageLogBytes` (default 16 MiB), the server keeps the newest lines that fit in half of it.
 
 `GET /v1/usage?after=<seq>` returns `{"id","first","next","entries"}`: the lines with a `seq` above `after` (default 0), about 1 MiB at most per response. `next` is the last `seq` returned, or `after` when none is; a client ahead of the log gets the newest `seq` instead. `first` is the oldest `seq` still kept, so a client can tell that lines were trimmed past its position. Soma's `client` package doesn't call this route.

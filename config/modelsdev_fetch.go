@@ -20,10 +20,11 @@ const (
 
 // RefreshModelsDev fetches the models.dev catalog for every opted-in provider
 // whose cached data is missing or due (ShouldFetchModelsDev), once per
-// catalog provider id. Failures are cached, not shown. Interactive mode calls
-// it once after the first prompt; axon ask never does.
+// catalog provider id. Failures are cached, not shown. The server calls it
+// on requests; interactive clients can call it after their first prompt.
 func RefreshModelsDev(cfg *Config) {
 	done := map[string]bool{}
+	fetched := false
 	for _, pc := range cfg.Providers {
 		id := pc.ModelsDev
 		if id == "" || done[id] {
@@ -32,9 +33,10 @@ func RefreshModelsDev(cfg *Config) {
 		done[id] = true
 		if ShouldFetchModelsDev(cfg.ModelsDev(id), time.Now()) {
 			FetchModelsDev(cfg, id, modelsDevFetchLimit)
+			fetched = true
 		}
 	}
-	if len(done) > 0 {
+	if fetched {
 		debug.FreeOSMemory()
 	}
 }
