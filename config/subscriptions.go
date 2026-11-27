@@ -28,10 +28,10 @@ func subscriptionModels(api string) []ModelInfo {
 	switch api {
 	case "claude-code":
 		return []ModelInfo{
-			{ID: "claude-sonnet-5-5", ContextWindow: 1000000},
-			{ID: "claude-opus-5-5", ContextWindow: 1000000},
-			{ID: "claude-fable-5-2", ContextWindow: 1000000},
-			{ID: "claude-haiku-5-5", ContextWindow: 1000000},
+			{ID: "claude-sonnet-5-5", ContextWindow: 1000000, Input: []string{"text", "image"}},
+			{ID: "claude-opus-5-5", ContextWindow: 1000000, Input: []string{"text", "image"}},
+			{ID: "claude-fable-5-2", ContextWindow: 1000000, Input: []string{"text", "image"}},
+			{ID: "claude-haiku-5-5", ContextWindow: 1000000, Input: []string{"text", "image"}},
 		}
 	}
 	return nil

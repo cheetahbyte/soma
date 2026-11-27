@@ -19,11 +19,12 @@ import (
 const maxModelListBytes = 16 << 20
 
 type codexModel struct {
-	Slug          string       `json:"slug"`
-	ContextWindow float64      `json:"context_window"`
-	Levels        []codexLevel `json:"supported_reasoning_levels"`
-	Visibility    string       `json:"visibility"`
-	Priority      *float64     `json:"priority"`
+	Slug            string       `json:"slug"`
+	ContextWindow   float64      `json:"context_window"`
+	Levels          []codexLevel `json:"supported_reasoning_levels"`
+	Visibility      string       `json:"visibility"`
+	Priority        *float64     `json:"priority"`
+	InputModalities []string     `json:"input_modalities"`
 }
 
 type codexLevel struct {
@@ -97,6 +98,11 @@ func (c *Client) codexModels(ctx context.Context) (_ []config.ModelInfo, err err
 // offered: the list does not say whether a model accepts effort none.
 func (m codexModel) info() config.ModelInfo {
 	info := config.ModelInfo{ID: m.Slug, ContextWindow: int(m.ContextWindow)}
+	for _, mod := range m.InputModalities {
+		if (mod == "text" || mod == "image") && !slices.Contains(info.Input, mod) {
+			info.Input = append(info.Input, mod)
+		}
+	}
 	for _, l := range codexLevels {
 		if slices.Contains(m.Levels, codexLevel{l}) {
 			info.Thinking = append(info.Thinking, l)

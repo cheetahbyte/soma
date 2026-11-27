@@ -22,7 +22,8 @@ type ModelInfo struct {
 	Reasoning      *bool             `json:"reasoning"`      // false: the model does not reason
 	Effort         map[string]string `json:"effort"`         // level -> wire value
 	ThinkingFormat string            `json:"thinkingFormat"` // openai-chat: "" or "deepseek"
-	InputPrice     float64           `json:"inputPrice"`     // per million tokens
+	Input          []string          `json:"input,omitempty"`
+	InputPrice     float64           `json:"inputPrice"` // per million tokens
 	OutputPrice    float64           `json:"outputPrice"`
 	CachedPrice    float64           `json:"cachedPrice"`
 }

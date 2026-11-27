@@ -21,11 +21,12 @@ type ModelsDevModel struct {
 	CachedPrice   float64  `json:"cachedPrice,omitempty"`
 	Reasoning     *bool    `json:"reasoning,omitempty"`
 	Thinking      []string `json:"thinking,omitempty"`
+	Input         []string `json:"input,omitempty"`
 }
 
 func (m ModelsDevModel) info(id string) ModelInfo {
 	return ModelInfo{ID: id, ContextWindow: m.ContextWindow, MaxOutput: m.MaxOutput, InputPrice: m.InputPrice,
-		OutputPrice: m.OutputPrice, CachedPrice: m.CachedPrice, Reasoning: m.Reasoning, Thinking: m.Thinking}
+		OutputPrice: m.OutputPrice, CachedPrice: m.CachedPrice, Reasoning: m.Reasoning, Thinking: m.Thinking, Input: m.Input}
 }
 
 // ModelsDevCache holds the slimmed records of one provider of the models.dev
@@ -132,6 +133,9 @@ type modelsDevRecord struct {
 		Output    float64 `json:"output"`
 		CacheRead float64 `json:"cache_read"`
 	} `json:"cost"`
+	Modalities struct {
+		Input []string `json:"input"`
+	} `json:"modalities"`
 }
 
 // Tiered prices in the record are ignored: the base price is used.
@@ -142,6 +146,11 @@ func (r modelsDevRecord) model() ModelsDevModel {
 		InputPrice:    r.Cost.Input,
 		OutputPrice:   r.Cost.Output,
 		CachedPrice:   r.Cost.CacheRead,
+	}
+	for _, mod := range r.Modalities.Input {
+		if (mod == "text" || mod == "image") && !slices.Contains(m.Input, mod) {
+			m.Input = append(m.Input, mod)
+		}
 	}
 	if r.Reasoning != nil && !*r.Reasoning {
 		off := false

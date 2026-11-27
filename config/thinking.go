@@ -80,6 +80,9 @@ func (m ModelInfo) override(o ModelInfo) ModelInfo {
 	if o.ThinkingFormat != "" {
 		m.ThinkingFormat = o.ThinkingFormat
 	}
+	if o.Input != nil {
+		m.Input = o.Input
+	}
 	if o.InputPrice != 0 {
 		m.InputPrice = o.InputPrice
 	}

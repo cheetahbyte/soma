@@ -124,6 +124,7 @@ func New(o Options) (*Server, error) {
 	s.mux.HandleFunc("POST /v1/abort", s.abort)
 	s.mux.HandleFunc("POST /v1/endrun", s.endRun)
 	s.mux.HandleFunc("GET /v1/info", s.info)
+	s.mux.HandleFunc("GET /v1/upstreams", s.upstreams)
 	s.mux.HandleFunc("PUT /v1/blobs/{sha256}", s.putBlob)
 	s.mux.HandleFunc("PUT /v1/artifacts/{task}/{name}", s.putArtifact)
 	s.mux.HandleFunc("GET /v1/artifacts/{task}/{name}", s.getArtifact)
@@ -427,6 +428,24 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)
+}
+
+func (s *Server) upstreams(w http.ResponseWriter, r *http.Request) {
+	cfg, err := s.config()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, false, fmt.Errorf("soma: reading the configuration: %w", err))
+		return
+	}
+	names := make([]string, 0, len(cfg.Providers))
+	for name, pc := range cfg.Providers {
+		if pc.API == "soma" {
+			continue
+		}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(wire.Upstreams{Upstreams: names})
 }
 
 func (s *Server) endRun(w http.ResponseWriter, r *http.Request) {

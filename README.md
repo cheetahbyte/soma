@@ -91,6 +91,8 @@ Explicit model prices take precedence over catalog prices. Without usable prices
 
 The server appends one line to `<root>/usage.jsonl` for each provider call whose reply reports tokens, including aborted calls and replies that never reached the asking side. A line holds `seq`, `time`, `upstream`, `api`, `model`, `sessionId`, `usage`, and `stopReason`, never message content. The file's first line, `{"id":...}`, names the log; a new log gets a new id and starts again at `seq` 1. When the file grows past `Options.UsageLogBytes` (default 16 MiB), the server keeps the newest lines that fit in half of it.
 
+`GET /v1/upstreams` returns `{"upstreams": [...]}` with the sorted names of all configured upstreams on the server (excluding `soma` entries).
+
 `GET /v1/usage?after=<seq>` returns `{"id","first","next","entries"}`: the lines with a `seq` above `after` (default 0), about 1 MiB at most per response. `next` is the last `seq` returned, or `after` when none is; a client ahead of the log gets the newest `seq` instead. `first` is the oldest `seq` still kept, so a client can tell that lines were trimmed past its position. Soma's `client` package doesn't call this route.
 
 ## The program

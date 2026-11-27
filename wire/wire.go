@@ -74,6 +74,10 @@ type Info struct {
 	Models            []config.ModelInfo `json:"models"`
 }
 
+type Upstreams struct {
+	Upstreams []string `json:"upstreams"`
+}
+
 type UsageEntry struct {
 	Seq        int64           `json:"seq"`
 	Time       time.Time       `json:"time"`

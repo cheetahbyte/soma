@@ -24,12 +24,15 @@ type catalogEntry struct {
 // catalogMeta is the part of Melious's _meta axon uses
 // (melious-provider.ts, MeliousMeta).
 type catalogMeta struct {
-	Type            string  `json:"type"`
-	ContextLength   float64 `json:"context_length"`
-	MaxOutputTokens float64 `json:"max_output_tokens"`
-	ReasoningType   string  `json:"reasoning_type"`
+	Type            string   `json:"type"`
+	ContextLength   float64  `json:"context_length"`
+	MaxOutputTokens float64  `json:"max_output_tokens"`
+	ReasoningType   string   `json:"reasoning_type"`
+	InputModalities []string `json:"input_modalities"`
 	Capabilities    struct {
-		Reasoning *bool `json:"reasoning"`
+		Reasoning  *bool `json:"reasoning"`
+		Vision     *bool `json:"vision"`
+		ImageInput *bool `json:"image_input"`
 	} `json:"capabilities"`
 	Pricing struct {
 		Input     float64 `json:"input_cost_per_million_eur"`
@@ -116,6 +119,26 @@ func (e catalogEntry) model() (config.ModelInfo, bool) {
 	// Melious turns a hybrid model's reasoning off only when told "none".
 	if meta.ReasoningType == "hybrid" {
 		m.Effort = map[string]string{"off": "none"}
+	}
+	if len(meta.InputModalities) > 0 {
+		for _, mod := range meta.InputModalities {
+			if mod == "text" || mod == "image" {
+				exists := false
+				for _, seen := range m.Input {
+					if seen == mod {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					m.Input = append(m.Input, mod)
+				}
+			}
+		}
+	} else if (meta.Capabilities.Vision != nil && *meta.Capabilities.Vision) || (meta.Capabilities.ImageInput != nil && *meta.Capabilities.ImageInput) {
+		m.Input = []string{"text", "image"}
+	} else if meta.Capabilities.Vision != nil || meta.Capabilities.ImageInput != nil {
+		m.Input = []string{"text"}
 	}
 	return m, true
 }

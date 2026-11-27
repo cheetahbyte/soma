@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `GET /v1/upstreams` lists all configured non-`soma` upstreams on the server in sorted order. `ModelInfo` now includes optional `input` modalities (`["text"]` / `["text", "image"]`), populated from `models.dev`, ChatGPT's model list, OpenAI-compatible `_meta` vision metadata, `claude-code` defaults, and `modelOverrides`.
 - The server keeps a usage log, `<root>/usage.jsonl`: one line per provider call that reported tokens, with the upstream, API, model, session id, usage, and stop reason, and no message content. It is bounded by `Options.UsageLogBytes` (default 16 MiB). `GET /v1/usage?after=<seq>` serves it in pages to a token-holding client, with the log's id and the oldest kept `seq`.
 - A `codex` provider without `models` takes its models from ChatGPT's model list instead of a bundled table. Hidden models are left out, the models keep ChatGPT's priority order, and `SuggestedDefault` names the first cached one. Each model gets ChatGPT's context window and `minimal` plus the supported levels from `low` to `xhigh`; `off` is offered only through `modelOverrides`. Until a fetch succeeds, any model id is accepted with the default values. `soma login codex` caches the list after the sign-in and warns when it can't read it. Explicit `models` stay authoritative and read no list.
 - Add versioned HTTP streaming libraries with bearer-token authentication and strict request decoding.
