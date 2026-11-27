@@ -28,22 +28,24 @@ import (
 )
 
 type Options struct {
-	Root           string
-	Token          string
-	KeepAlive      time.Duration
-	Grace          time.Duration
-	BlobCacheBytes int64
-	UsageLogBytes  int64
+	Root               string
+	Token              string
+	KeepAlive          time.Duration
+	Grace              time.Duration
+	BlobCacheBytes     int64
+	ArtifactCacheBytes int64
+	UsageLogBytes      int64
 }
 
 type Server struct {
-	o      Options
-	mux    *http.ServeMux
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
-	blobs  *blobStore
-	usage  *usageLog
+	o         Options
+	mux       *http.ServeMux
+	ctx       context.Context
+	cancel    context.CancelFunc
+	done      chan struct{}
+	blobs     *blobStore
+	artifacts *artifactStore
+	usage     *usageLog
 
 	loadMu sync.Mutex
 	cfg    *config.Config
@@ -116,13 +118,16 @@ func New(o Options) (*Server, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{o: o, cfg: cfg, stamp: st, mux: http.NewServeMux(), ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		blobs: newBlobStore(o.Root, o.BlobCacheBytes), usage: newUsageLog(o.Root, o.UsageLogBytes), providers: map[string]soma.Provider{}, runs: map[runKey]*run{},
+		blobs: newBlobStore(o.Root, o.BlobCacheBytes), artifacts: newArtifactStore(o.Root, o.ArtifactCacheBytes), usage: newUsageLog(o.Root, o.UsageLogBytes), providers: map[string]soma.Provider{}, runs: map[runKey]*run{},
 		pending: map[runKey]bool{}, streams: map[string]*live{}}
 	s.mux.HandleFunc("POST /v1/stream", s.stream)
 	s.mux.HandleFunc("POST /v1/abort", s.abort)
 	s.mux.HandleFunc("POST /v1/endrun", s.endRun)
 	s.mux.HandleFunc("GET /v1/info", s.info)
 	s.mux.HandleFunc("PUT /v1/blobs/{sha256}", s.putBlob)
+	s.mux.HandleFunc("PUT /v1/artifacts/{task}/{name}", s.putArtifact)
+	s.mux.HandleFunc("GET /v1/artifacts/{task}/{name}", s.getArtifact)
+	s.mux.HandleFunc("DELETE /v1/artifacts/{task}", s.deleteArtifact)
 	s.mux.HandleFunc("GET /v1/usage", s.getUsage)
 	return s, nil
 }
